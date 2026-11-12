@@ -23,9 +23,11 @@
 @rem
 @rem ##########################################################################
 
+@rem Set workspace-local ASCII GRADLE_USER_HOME so forked JDK worker @argfiles never break on non-ASCII user profiles
+if "%GRADLE_USER_HOME%"=="" set "GRADLE_USER_HOME=C:\AntigravityBlipper\.gradle-home"
+
 @rem Set local scope for the variables, and ensure extensions are enabled
 setlocal EnableExtensions
-set "GRADLE_USER_HOME=C:\AntigravityBlipper\.gradle-home"
 
 set DIRNAME=%~dp0
 if "%DIRNAME%"=="" set DIRNAME=.
