@@ -7,3 +7,5 @@
 *.iml
 .superpowers/
 *.log
+*.exe
+desktopApp/packaging/*.ico
