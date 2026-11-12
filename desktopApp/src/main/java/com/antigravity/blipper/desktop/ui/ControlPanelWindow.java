@@ -139,7 +139,7 @@ public class ControlPanelWindow extends JFrame {
         approveNetBtn.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
         approveNetBtn.addActionListener(e -> approveCurrentNetworkAsync());
 
-        JButton fwBtn = new JButton("🛡️ LocalSubnet Güvenlik Duvarı İzni Ekle");
+        JButton fwBtn = new JButton("■ LocalSubnet Güvenlik Duvarı İzni Ekle");
         fwBtn.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
         fwBtn.addActionListener(e -> runElevatedFirewallRule(true));
 
@@ -158,7 +158,7 @@ public class ControlPanelWindow extends JFrame {
         pairCard.add(ttlRow);
         pairCard.add(Box.createVerticalStrut(10));
 
-        JButton startPairBtn = new JButton("🔑 60 Saniyelik Eşleştirme Başlat (mTLS 1.3 Portunu Aç)");
+        JButton startPairBtn = new JButton("► 60 Saniyelik Eşleştirme Başlat (mTLS 1.3 Portunu Aç)");
         startPairBtn.setFont(new Font("Segoe UI", Font.BOLD, 15));
         startPairBtn.setBackground(new Color(2, 132, 199));
         startPairBtn.setForeground(Color.WHITE);
@@ -177,7 +177,7 @@ public class ControlPanelWindow extends JFrame {
 
         // 3. Test & Nuclear Wipe Card
         JPanel actionCard = createSectionPanel("3. Test & Karşılıklı Tam İmha (Kill Switch)");
-        JButton testBtn = new JButton("⚡ Test Bildirimi Gönder (Masaüstü Üst Pencere + Telefona 5x Bildirim)");
+        JButton testBtn = new JButton("► Test Bildirimi Gönder (Masaüstü Üst Pencere + Telefona 5x Bildirim)");
         testBtn.setFont(new Font("Segoe UI", Font.BOLD, 14));
         testBtn.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
         testBtn.setMaximumSize(new Dimension(Integer.MAX_VALUE, 42));
@@ -186,7 +186,7 @@ public class ControlPanelWindow extends JFrame {
                 "Masaüstü üst pencere ve 5x Samsung uyandırma hattı çalışıyor!"
         ));
 
-        JButton nuclearDisconnectBtn = new JButton("💣 BAĞLANTIYI KES VE TÜM KAYITLARI SİL (PC + TELEFON)");
+        JButton nuclearDisconnectBtn = new JButton("[!] BAĞLANTIYI KES VE TÜM KAYITLARI SİL (PC + TELEFON)");
         nuclearDisconnectBtn.setFont(new Font("Segoe UI", Font.BOLD, 18));
         nuclearDisconnectBtn.setBackground(new Color(185, 28, 28));
         nuclearDisconnectBtn.setForeground(Color.WHITE);
@@ -197,7 +197,7 @@ public class ControlPanelWindow extends JFrame {
             refreshUiState();
         });
 
-        JButton fullExitBtn = new JButton("🚪 Uygulamayı Tamamen Kapat (Portu Kapat & Tüm Anahtarları İmha Et)");
+        JButton fullExitBtn = new JButton("✕ Uygulamayı Tamamen Kapat (Portu Kapat & Tüm Anahtarları İmha Et)");
         fullExitBtn.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
         fullExitBtn.setMaximumSize(new Dimension(Integer.MAX_VALUE, 38));
         fullExitBtn.addActionListener(e -> {
@@ -319,13 +319,13 @@ public class ControlPanelWindow extends JFrame {
         if (st == SessionStateRegistry.State.CLOSED || !lanServer.isListening()) {
             statusBadgeLabel.setBackground(new Color(20, 83, 45));
             statusBadgeLabel.setForeground(new Color(220, 252, 231));
-            statusBadgeLabel.setText("🔒 GÜVENLİ KİLİT AKTİF — 0 AÇIK LAN PORTU ( Sıfır Kayıtlı Anahtar )");
+            statusBadgeLabel.setText("■ GÜVENLİ KİLİT AKTİF — 0 AÇIK LAN PORTU ( Sıfır Kayıtlı Anahtar )");
             pinDisplayLabel.setText("PORT KAPALI — Aktif eşleştirme kodu yok");
         } else if (st == SessionStateRegistry.State.PAIRING_WINDOW) {
             long remSec = Math.max(0L, (sessionRegistry.getPairingExpiresAtMs() - now) / 1000L);
             statusBadgeLabel.setBackground(new Color(146, 64, 14));
             statusBadgeLabel.setForeground(new Color(254, 243, 199));
-            statusBadgeLabel.setText("🟡 EŞLEŞTİRME BEKLENİYOR (" + remSec + " sn kaldı) — Port: " + currentHostPortDisplay);
+            statusBadgeLabel.setText("● EŞLEŞTİRME BEKLENİYOR (" + remSec + " sn kaldı) — Port: " + currentHostPortDisplay);
             pinDisplayLabel.setText("KOD:  " + currentPinDisplay + "    |    ADRES:  " + currentHostPortDisplay);
         } else {
             var snapOpt = sessionRegistry.getActiveSessionSnapshot();
@@ -337,8 +337,8 @@ public class ControlPanelWindow extends JFrame {
             boolean wsLive = lanServer.hasActiveAuthenticatedStream();
             statusBadgeLabel.setBackground(new Color(3, 105, 161));
             statusBadgeLabel.setForeground(Color.WHITE);
-            statusBadgeLabel.setText("🟢 ŞİFRELİ mTLS 1.3 OTURUMU: " + dev
-                    + (wsLive ? " [CANLI WSS BAĞLI]" : " [BAĞLANTI BEKLENİYOR]")
+            statusBadgeLabel.setText("● ŞİFRELİ mTLS 1.3 OTURUMU: " + dev
+                    + (wsLive ? " [CANLI WSS BAĞLI ✓]" : " [OTOMATİK YENİDEN BAĞLANIYOR...]")
                     + " | Süre: " + ttlText);
             pinDisplayLabel.setText("EŞLEŞME TAMAMLANDI — Tek kullanımlık PIN bellekten silindi ✓");
         }

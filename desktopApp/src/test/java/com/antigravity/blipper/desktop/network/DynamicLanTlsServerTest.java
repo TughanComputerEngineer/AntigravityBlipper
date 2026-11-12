@@ -227,6 +227,110 @@ class DynamicLanTlsServerTest {
         assertThrows(ConnectException.class, () -> new Socket("127.0.0.1", startInfo.lanPort()).close());
     }
 
+    @Test
+    void authenticatedPhoneSocketDropAndReconnectDoesNotFireFalseTlsHandshakeIntrusionAndDeliversBufferedAlert() throws Exception {
+        networkService.approveNetworkForCurrentSession(networkService.readCurrentNetwork().orElseThrow());
+        List<IntrusionEvent> events = new CopyOnWriteArrayList<>();
+        server.addIntrusionListener(events::add);
+
+        var startInfo = server.startForPairing(0, 0, 6, Duration.ofHours(4));
+        var phoneCert = crypto.generateEphemeralEcCert("Samsung-Galaxy-A73");
+        SSLContext phoneSsl = buildClientSslContext(phoneCert, startInfo.serverCertSha256Hex());
+
+        long ts = System.currentTimeMillis();
+        String proof = crypto.computePairingProofHex(
+                startInfo.pinCode().toCharArray(),
+                startInfo.serverCertSha256Hex(),
+                phoneCert.sha256Hex(),
+                ts,
+                "pair-nonce-reconnect"
+        );
+        String pairJson = mapper.writeValueAsString(java.util.Map.of(
+                "deviceName", "Samsung SM-A736B",
+                "timestampMs", ts,
+                "nonce", "pair-nonce-reconnect",
+                "proofHex", proof
+        ));
+
+        JsonNode pairResp;
+        try (SSLSocket pairSock = (SSLSocket) phoneSsl.getSocketFactory().createSocket("127.0.0.1", startInfo.lanPort())) {
+            pairSock.setEnabledProtocols(new String[]{"TLSv1.3"});
+            pairSock.startHandshake();
+            String httpReq = "POST /api/v1/pair/complete HTTP/1.1\r\n"
+                    + "Host: 127.0.0.1\r\n"
+                    + "Content-Type: application/json\r\n"
+                    + "Content-Length: " + pairJson.getBytes(StandardCharsets.UTF_8).length + "\r\n"
+                    + "Connection: close\r\n\r\n"
+                    + pairJson;
+            pairSock.getOutputStream().write(httpReq.getBytes(StandardCharsets.UTF_8));
+            pairSock.getOutputStream().flush();
+            String rawHttpResp = new String(pairSock.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+            pairResp = mapper.readTree(rawHttpResp.substring(rawHttpResp.indexOf("\r\n\r\n") + 4));
+        }
+        String bearerToken = pairResp.get("bearerToken").asText();
+        byte[] hmacKey = HexFormat.of().parseHex(pairResp.get("hmacKeyHex").asText());
+
+        // 1st WSS connection opens, then aborts abruptly (simulating Wi-Fi roam / TCP reset)
+        SSLSocket ws1 = (SSLSocket) phoneSsl.getSocketFactory().createSocket("127.0.0.1", startInfo.lanPort());
+        ws1.setEnabledProtocols(new String[]{"TLSv1.3"});
+        ws1.startHandshake();
+        String wsKey1 = Base64.getEncoder().encodeToString("reconnect-key-01".getBytes(StandardCharsets.UTF_8));
+        String upgrade1 = "GET /ws/v1/stream HTTP/1.1\r\n"
+                + "Host: 127.0.0.1\r\n"
+                + "Upgrade: websocket\r\n"
+                + "Connection: Upgrade\r\n"
+                + "Sec-WebSocket-Key: " + wsKey1 + "\r\n"
+                + "Sec-WebSocket-Version: 13\r\n"
+                + "Authorization: Bearer " + bearerToken + "\r\n\r\n";
+        ws1.getOutputStream().write(upgrade1.getBytes(StandardCharsets.UTF_8));
+        ws1.getOutputStream().flush();
+        assertTrue(readHttpHeader(ws1.getInputStream()).startsWith("HTTP/1.1 101"));
+        assertEquals(1, events.stream()
+                .filter(e -> e.type() == IntrusionEvent.IntrusionType.AUTHENTICATED_DEVICE_CONNECT)
+                .count());
+
+        // Simulate abrupt TCP RST (`setSoLinger(true, 0)`) on the paired phone's WSS socket!
+        ws1.setSoLinger(true, 0);
+        ws1.close();
+        Thread.sleep(200);
+
+        assertTrue(events.stream().noneMatch(e -> !e.authorizedConnection()),
+                "Abrupt drop of an already-authenticated WSS socket must NEVER fire a false TLS_HANDSHAKE_FAILED intrusion alarm");
+        assertEquals(SessionStateRegistry.State.ACTIVE_SESSION, registry.getState(),
+                "Transient socket drop must preserve ACTIVE_SESSION within authorized TTL");
+
+        // Task completes while phone Wi-Fi is momentarily reconnecting -> must be buffered for replay!
+        assertTrue(server.sendTaskCompleted("Derin Mimari Analizi", "Görev çevrimdışı tamponlandı"));
+
+        // 2nd WSS connection (auto-reconnect of exact same paired phone) attaches cleanly and receives buffered alert!
+        try (SSLSocket ws2 = (SSLSocket) phoneSsl.getSocketFactory().createSocket("127.0.0.1", startInfo.lanPort())) {
+            ws2.setEnabledProtocols(new String[]{"TLSv1.3"});
+            ws2.startHandshake();
+            String wsKey2 = Base64.getEncoder().encodeToString("reconnect-key-02".getBytes(StandardCharsets.UTF_8));
+            String upgrade2 = "GET /ws/v1/stream HTTP/1.1\r\n"
+                    + "Host: 127.0.0.1\r\n"
+                    + "Upgrade: websocket\r\n"
+                    + "Connection: Upgrade\r\n"
+                    + "Sec-WebSocket-Key: " + wsKey2 + "\r\n"
+                    + "Sec-WebSocket-Version: 13\r\n"
+                    + "Authorization: Bearer " + bearerToken + "\r\n\r\n";
+            ws2.getOutputStream().write(upgrade2.getBytes(StandardCharsets.UTF_8));
+            ws2.getOutputStream().flush();
+            assertTrue(readHttpHeader(ws2.getInputStream()).startsWith("HTTP/1.1 101"));
+
+            // Must NOT spam a duplicate AUTHENTICATED_DEVICE_CONNECT siren on background reconnect of same session!
+            assertEquals(1, events.stream()
+                    .filter(e -> e.type() == IntrusionEvent.IntrusionType.AUTHENTICATED_DEVICE_CONNECT)
+                    .count());
+
+            String bufferedFrame = readUnmaskedServerWsTextFrame(ws2.getInputStream());
+            SignedEnvelope bufferedEnv = mapper.readValue(bufferedFrame, SignedEnvelope.class);
+            assertEquals("TASK_COMPLETED", bufferedEnv.type());
+            assertTrue(crypto.verifyEnvelope(hmacKey, bufferedEnv));
+            assertTrue(bufferedEnv.payloadJson().contains("Derin Mimari Analizi"));
+        }
+    }
+
     private SSLContext buildClientSslContext(
             EphemeralKeyMaterialService.EphemeralCertBundle clientBundle,
             String pinnedServerSha256Hex

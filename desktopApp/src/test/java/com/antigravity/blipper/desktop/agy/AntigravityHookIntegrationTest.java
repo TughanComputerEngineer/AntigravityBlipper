@@ -8,6 +8,7 @@ import com.antigravity.blipper.desktop.security.SessionStateRegistry;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.CleanupMode;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.OutputStream;
@@ -30,7 +31,9 @@ class AntigravityHookIntegrationTest {
     private final ObjectMapper mapper = new ObjectMapper();
 
     @Test
-    void readerResolvesSqliteWalTitleSanitizesMarkdownAndIgnoresSubagentsOrCanceledRuns(@TempDir Path tempDir) throws Exception {
+    void readerResolvesSqliteWalTitleSanitizesMarkdownAndIgnoresSubagentsOrCanceledRuns(
+            @TempDir(cleanup = CleanupMode.NEVER) Path tempDir
+    ) throws Exception {
         Path unicodeDir = tempDir.resolve("Tuğhan").resolve(".gemini").resolve("antigravity");
         Files.createDirectories(unicodeDir);
         Path dbFile = unicodeDir.resolve("conversation_summaries.db");

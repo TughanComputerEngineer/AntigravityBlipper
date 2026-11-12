@@ -77,7 +77,7 @@ class BlipperDesktopContextTest {
                 false
         );
         var alertVm = IntrusionAlertWindow.buildAlertViewModel(unauthorized);
-        assertEquals("🛑 LOGLA VE PORTU ANINDA KAPAT", IntrusionAlertWindow.KILL_BUTTON_LABEL);
+        assertEquals("[!] LOGLA VE PORTU ANINDA KAPAT", IntrusionAlertWindow.KILL_BUTTON_LABEL);
         assertTrue(alertVm.headline().contains("GÜVENLİK ALARMI"));
         assertTrue(alertVm.detailsText().contains("192.168.1.99:51234"));
         assertTrue(alertVm.detailsText().contains("Cafe_WiFi"));

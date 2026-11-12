@@ -8,32 +8,47 @@ import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
+import java.util.Base64;
 import java.util.Optional;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
 
 @Service
 public class WindowsNetworkFingerprintService {
 
+    public static final String PROBE_PREFIX = "BLIPPER_NET|";
+    private static final int MAX_CONSECUTIVE_EMPTY_PROBES_BEFORE_UNTRUSTED = 3;
+
     private static final String POWERSHELL_PROBE_SCRIPT =
-            "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
-            + "$cfg = Get-NetIPConfiguration | Where-Object { $_.IPv4DefaultGateway -ne $null -and $_.NetAdapter.Status -eq 'Up' } | Select-Object -First 1; "
-            + "if ($null -ne $cfg) { "
-            + "  $prof = [string]$cfg.NetProfile.Name; "
-            + "  $alias = [string]$cfg.InterfaceAlias; "
-            + "  $ip = [string]($cfg.IPv4Address | Select-Object -First 1).IPAddress; "
-            + "  $gw = [string]$cfg.IPv4DefaultGateway.NextHop; "
-            + "  $mac = [string](Get-NetNeighbor -IPAddress $gw -ErrorAction SilentlyContinue | Where-Object { $_.LinkLayerAddress } | Select-Object -First 1).LinkLayerAddress; "
-            + "  if ([string]::IsNullOrWhiteSpace($mac)) { "
-            + "    $null = Test-Connection -ComputerName $gw -Count 1 -Quiet -ErrorAction SilentlyContinue; "
-            + "    $mac = [string](Get-NetNeighbor -IPAddress $gw -ErrorAction SilentlyContinue | Where-Object { $_.LinkLayerAddress } | Select-Object -First 1).LinkLayerAddress; "
-            + "  } "
-            + "  Write-Output \"$prof|$alias|$ip|$gw|$mac\" "
-            + "}";
+            "$ProgressPreference = 'SilentlyContinue'\n"
+            + "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8\n"
+            + "$nic = [System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces() | Where-Object {\n"
+            + "  $_.OperationalStatus -eq 'Up' -and $_.NetworkInterfaceType -ne 'Loopback' -and "
+            + "  ($_.GetIPProperties().GatewayAddresses | Where-Object { $_.Address.AddressFamily -eq 'InterNetwork' -and $_.Address.IPAddressToString -ne '0.0.0.0' })\n"
+            + "} | Select-Object -First 1\n"
+            + "if ($null -ne $nic) {\n"
+            + "  $props = $nic.GetIPProperties()\n"
+            + "  $idx = $props.GetIPv4Properties().Index\n"
+            + "  $gw = ($props.GatewayAddresses | Where-Object { $_.Address.AddressFamily -eq 'InterNetwork' -and $_.Address.IPAddressToString -ne '0.0.0.0' } | Select-Object -First 1).Address.IPAddressToString\n"
+            + "  $ip = ($props.UnicastAddresses | Where-Object { $_.Address.AddressFamily -eq 'InterNetwork' } | Select-Object -First 1).Address.IPAddressToString\n"
+            + "  $cimProf = Get-CimInstance -Namespace root/StandardCimv2 -ClassName MSFT_NetConnectionProfile -Filter \"InterfaceIndex = $idx\" -ErrorAction SilentlyContinue | Select-Object -First 1\n"
+            + "  $prof = if ($cimProf -and $cimProf.Name) { [string]$cimProf.Name } else { [string]$nic.Description }\n"
+            + "  $arpLine = (arp -a $gw 2>$null | Select-String '([0-9a-fA-F]{2}[:-]){5}[0-9a-fA-F]{2}' | Select-Object -First 1)\n"
+            + "  if (-not $arpLine) {\n"
+            + "    $null = ping -n 1 -w 400 $gw 2>$null\n"
+            + "    $arpLine = (arp -a $gw 2>$null | Select-String '([0-9a-fA-F]{2}[:-]){5}[0-9a-fA-F]{2}' | Select-Object -First 1)\n"
+            + "  }\n"
+            + "  $mac = if ($arpLine) { $arpLine.Matches[0].Value.ToUpper() } else { '' }\n"
+            + "  [Console]::Out.WriteLine(('BLIPPER_NET|{0}|{1}|{2}|{3}|{4}' -f $prof, $nic.Name, $ip, $gw, $mac))\n"
+            + "}\n";
+
+    private static final String ENCODED_POWERSHELL_PROBE =
+            Base64.getEncoder().encodeToString(POWERSHELL_PROBE_SCRIPT.getBytes(StandardCharsets.UTF_16LE));
 
     private final Supplier<String> rawProbeSupplier;
     private final ExecutorService backgroundProbeExecutor = Executors.newSingleThreadExecutor(r -> {
@@ -43,6 +58,7 @@ public class WindowsNetworkFingerprintService {
     });
     private final AtomicBoolean refreshInFlight = new AtomicBoolean(false);
     private final AtomicLong lastRefreshStartedAtMs = new AtomicLong(0L);
+    private final AtomicInteger consecutiveEmptyProbes = new AtomicInteger(0);
 
     private volatile NetworkFingerprint approvedNetwork;
     private volatile NetworkFingerprint cachedSnapshot;
@@ -58,14 +74,18 @@ public class WindowsNetworkFingerprintService {
 
     public Optional<NetworkFingerprint> readCurrentNetwork() {
         try {
-            String line = rawProbeSupplier.get();
-            if (line == null || line.isBlank()) {
+            String raw = rawProbeSupplier.get();
+            if (raw == null || raw.isBlank()) {
                 this.cachedSnapshot = null;
                 this.lastRefreshStartedAtMs.set(System.currentTimeMillis());
                 return Optional.empty();
             }
-            String[] parts = line.trim().split("\\|", -1);
-            if (parts.length < 5) {
+            String trimmed = raw.trim();
+            String payload = trimmed.startsWith(PROBE_PREFIX)
+                    ? trimmed.substring(PROBE_PREFIX.length())
+                    : trimmed;
+            String[] parts = payload.split("\\|", -1);
+            if (parts.length != 5) {
                 this.cachedSnapshot = null;
                 this.lastRefreshStartedAtMs.set(System.currentTimeMillis());
                 return Optional.empty();
@@ -127,6 +147,7 @@ public class WindowsNetworkFingerprintService {
         }
         this.approvedNetwork = fingerprint;
         this.cachedSnapshot = fingerprint;
+        this.consecutiveEmptyProbes.set(0);
     }
 
     public synchronized Optional<NetworkFingerprint> getApprovedNetwork() {
@@ -158,8 +179,27 @@ public class WindowsNetworkFingerprintService {
         return currentOpt.filter(this::matchesApprovedNetwork).isPresent();
     }
 
+    /**
+     * Used by the periodic watchdog: immediately rejects any different SSID or gateway MAC on the first check,
+     * while tolerating up to 2 transient empty probe timeouts under heavy CPU load before declaring loss of trust.
+     */
+    public boolean isCurrentNetworkTrustedForWatchdog() {
+        NetworkFingerprint approved = this.approvedNetwork;
+        if (approved == null || !approved.isValidForLock()) {
+            return false;
+        }
+        Optional<NetworkFingerprint> currentOpt = readCurrentNetwork();
+        if (currentOpt.isPresent()) {
+            consecutiveEmptyProbes.set(0);
+            return matchesApprovedNetwork(currentOpt.get());
+        }
+        int misses = consecutiveEmptyProbes.incrementAndGet();
+        return misses < MAX_CONSECUTIVE_EMPTY_PROBES_BEFORE_UNTRUSTED;
+    }
+
     public synchronized void clearApprovedNetwork() {
         this.approvedNetwork = null;
+        this.consecutiveEmptyProbes.set(0);
     }
 
     @PreDestroy
@@ -185,29 +225,31 @@ public class WindowsNetworkFingerprintService {
         try {
             process = new ProcessBuilder(
                     "powershell.exe",
+                    "-NoLogo",
                     "-NoProfile",
                     "-NonInteractive",
+                    "-OutputFormat", "Text",
                     "-ExecutionPolicy", "Bypass",
-                    "-Command", POWERSHELL_PROBE_SCRIPT
-            ).redirectErrorStream(true).start();
+                    "-EncodedCommand", ENCODED_POWERSHELL_PROBE
+            ).redirectError(ProcessBuilder.Redirect.DISCARD).start();
 
-            StringBuilder out = new StringBuilder();
+            String matchedLine = "";
             try (BufferedReader reader = new BufferedReader(
                     new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8))) {
                 String line;
                 while ((line = reader.readLine()) != null) {
-                    if (line.contains("|")) {
-                        out.setLength(0);
-                        out.append(line.trim());
+                    int idx = line.indexOf(PROBE_PREFIX);
+                    if (idx >= 0) {
+                        matchedLine = line.substring(idx).trim();
                     }
                 }
             }
-            boolean finished = process.waitFor(3500, TimeUnit.MILLISECONDS);
+            boolean finished = process.waitFor(6000, TimeUnit.MILLISECONDS);
             if (!finished) {
                 process.destroyForcibly();
                 return "";
             }
-            return out.toString();
+            return matchedLine;
         } catch (Exception e) {
             return "";
         } finally {

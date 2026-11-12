@@ -31,6 +31,14 @@ class EphemeralSessionStore {
         _state.update { it.copy(connecting = true, statusMessage = message) }
     }
 
+    fun updateLiveStreamStatus(message: String) {
+        synchronized(lock) {
+            if (_state.value.connected) {
+                _state.update { it.copy(connecting = false, statusMessage = message) }
+            }
+        }
+    }
+
     fun setDisconnectedStatus(message: String) {
         _state.update {
             it.copy(

@@ -4,6 +4,7 @@ import com.antigravity.blipper.desktop.agy.AntigravityConversationReader;
 import com.antigravity.blipper.desktop.agy.LocalHookController;
 import com.antigravity.blipper.desktop.crypto.EphemeralKeyMaterialService;
 import com.antigravity.blipper.desktop.network.DynamicLanTlsServer;
+import com.antigravity.blipper.desktop.network.IntrusionEvent;
 import com.antigravity.blipper.desktop.network.NuclearTeardownCoordinator;
 import com.antigravity.blipper.desktop.network.WindowsNetworkFingerprintService;
 import com.antigravity.blipper.desktop.security.SecurityAuditLogger;
@@ -14,6 +15,7 @@ import org.junit.jupiter.api.io.TempDir;
 import javax.swing.SwingUtilities;
 import java.awt.GraphicsEnvironment;
 import java.nio.file.Path;
+import java.time.Instant;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -76,6 +78,31 @@ class ControlPanelWindowSafetyTest {
             assertTrue(updatedOnEdt.get(), "ControlPanelWindow.onNuclearTeardown must marshal Swing mutations onto the EDT");
         } finally {
             SwingUtilities.invokeAndWait(window::dispose);
+        }
+    }
+
+    @Test
+    void alertAndBannerStringsContainZeroSupplementaryEmojiBoxes() {
+        IntrusionEvent unauth = new IntrusionEvent(
+                IntrusionEvent.IntrusionType.TLS_HANDSHAKE_FAILED,
+                "192.168.1.77", 51234, "SUPERONLINE_Wi-Fi", "CC-29-BD-29-00-B0",
+                Instant.now(), "Rejected", false
+        );
+        IntrusionEvent auth = new IntrusionEvent(
+                IntrusionEvent.IntrusionType.AUTHENTICATED_DEVICE_CONNECT,
+                "192.168.1.3", 45060, "SUPERONLINE_Wi-Fi", "CC-29-BD-29-00-B0",
+                Instant.now(), "Connected", true
+        );
+        assertNoSurrogates(IntrusionAlertWindow.KILL_BUTTON_LABEL);
+        assertNoSurrogates(IntrusionAlertWindow.buildAlertViewModel(unauth).headline());
+        assertNoSurrogates(IntrusionAlertWindow.buildAlertViewModel(auth).headline());
+        assertNoSurrogates(TaskCompletedBannerWindow.formatDisplayBanner("ANTIGRAVITY: Test: Hazır"));
+    }
+
+    private static void assertNoSurrogates(String text) {
+        for (int i = 0; i < text.length(); i++) {
+            assertFalse(Character.isSurrogate(text.charAt(i)),
+                    "Swing Segoe UI text must not contain supplementary plane emoji that renders as '□': " + text);
         }
     }
 }

@@ -47,6 +47,47 @@ class NetworkAndLoopbackSecurityTest {
     }
 
     @Test
+    void rejectsPowerShellParserErrorOutputAndAcceptsPrefixedProbeLine() {
+        AtomicReference<String> mockProbeOutput = new AtomicReference<>(
+                "+ ... t 1).LinkLayerAddress;   }   Write-Output $prof|$alias|$ip|$gw|$mac }"
+        );
+        var svc = new WindowsNetworkFingerprintService(mockProbeOutput::get);
+        assertTrue(svc.readCurrentNetwork().isEmpty(),
+                "Garbled PowerShell parser error containing pipes must NEVER be accepted as a NetworkFingerprint");
+
+        mockProbeOutput.set("BLIPPER_NET|SUPERONLINE_Wi-Fi_1913|Wi-Fi|192.168.1.4|192.168.1.1|cc:29:bd:29:00:b0");
+        NetworkFingerprint valid = svc.readCurrentNetwork().orElseThrow();
+        assertEquals("SUPERONLINE_Wi-Fi_1913", valid.profileName());
+        assertEquals("Wi-Fi", valid.interfaceAlias());
+        assertEquals("192.168.1.4", valid.ipv4Address());
+        assertEquals("192.168.1.1", valid.gatewayIp());
+        assertEquals("CC-29-BD-29-00-B0", valid.gatewayMac());
+    }
+
+    @Test
+    void transientSingleEmptyNetworkProbeDoesNotFalselyInvalidateTrustedSession() {
+        AtomicReference<String> mockProbeOutput = new AtomicReference<>(
+                "BLIPPER_NET|HomeFiber|Wi-Fi|192.168.1.4|192.168.1.1|CC-29-BD-29-00-B0"
+        );
+        var svc = new WindowsNetworkFingerprintService(mockProbeOutput::get);
+        svc.approveNetworkForCurrentSession(svc.readCurrentNetwork().orElseThrow());
+
+        // 1 or 2 transient empty probe timeouts during heavy CPU load must NOT nuke session
+        mockProbeOutput.set("");
+        assertTrue(svc.isCurrentNetworkTrustedForWatchdog());
+        assertTrue(svc.isCurrentNetworkTrustedForWatchdog());
+
+        // 3rd consecutive empty probe means network is genuinely disconnected -> untrusted!
+        assertFalse(svc.isCurrentNetworkTrustedForWatchdog());
+
+        // Restore network -> trusted again, and switching to Cafe Wi-Fi must fail IMMEDIATELY on 1st tick!
+        mockProbeOutput.set("BLIPPER_NET|HomeFiber|Wi-Fi|192.168.1.4|192.168.1.1|CC-29-BD-29-00-B0");
+        assertTrue(svc.isCurrentNetworkTrustedForWatchdog());
+        mockProbeOutput.set("BLIPPER_NET|CafeWiFi|Wi-Fi|10.0.0.8|10.0.0.1|DE-AD-BE-EF-00-01");
+        assertFalse(svc.isCurrentNetworkTrustedForWatchdog());
+    }
+
+    @Test
     void backgroundRefreshRunsOffCallerThreadAndThrottlesRapidUiPolls() throws Exception {
         java.util.concurrent.atomic.AtomicInteger probeCount = new java.util.concurrent.atomic.AtomicInteger(0);
         AtomicReference<String> probeThreadName = new AtomicReference<>("");

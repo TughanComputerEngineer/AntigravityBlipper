@@ -32,6 +32,7 @@ import java.security.cert.CertificateException;
 import java.security.cert.X509Certificate;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.Arrays;
 import java.util.Base64;
 import java.util.HashMap;
 import java.util.HexFormat;
@@ -39,9 +40,13 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
+import java.util.UUID;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 
 @Service
@@ -50,7 +55,10 @@ public class DynamicLanTlsServer {
     private static final String WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
     private static final int MAX_HTTP_HEADER_BYTES = 16 * 1024;
     private static final int MAX_HTTP_BODY_BYTES = 32 * 1024;
-    private static final int MAX_WS_FRAME_BYTES = 64 * 1024;
+    private static final int MAX_WS_FRAME_BYTES = 65535;
+    private static final int WS_READ_TIMEOUT_MS = 90_000;
+    private static final long SERVER_WS_PING_INTERVAL_MS = 20_000L;
+    private static final long PENDING_TASK_BUFFER_TTL_MS = 120_000L;
 
     public record PairingStartInfo(
             int lanPort,
@@ -60,17 +68,26 @@ public class DynamicLanTlsServer {
             String serverCertSha256Hex
     ) {}
 
+    private record PendingTaskAlert(
+            String eventId,
+            String payloadJson,
+            long createdAtMs
+    ) {}
+
     private final EphemeralKeyMaterialService crypto;
     private final SessionStateRegistry sessionRegistry;
     private final WindowsNetworkFingerprintService networkService;
     private final UdpDiscoveryResponder udpDiscoveryResponder;
     private final ObjectMapper mapper = new ObjectMapper();
     private final List<Consumer<IntrusionEvent>> intrusionListeners = new CopyOnWriteArrayList<>();
+    private final AtomicLong lastAlertedGeneration = new AtomicLong(-1L);
 
     private volatile ServerSocket serverSocket;
     private volatile SSLContext sslContext;
     private volatile ExecutorService connectionExecutor;
+    private volatile ScheduledExecutorService keepaliveExecutor;
     private volatile WsClientConnection activeWsConnection;
+    private volatile PendingTaskAlert pendingTaskAlert;
     private volatile Runnable onRemoteNuclearTeardown;
 
     public DynamicLanTlsServer(
@@ -104,6 +121,18 @@ public class DynamicLanTlsServer {
                 t.setDaemon(true);
                 return t;
             });
+            ScheduledExecutorService keepalive = Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread t = new Thread(r, "blipper-lan-ws-keepalive");
+                t.setDaemon(true);
+                return t;
+            });
+            keepalive.scheduleWithFixedDelay(
+                    this::sendServerKeepalivePing,
+                    SERVER_WS_PING_INTERVAL_MS,
+                    SERVER_WS_PING_INTERVAL_MS,
+                    TimeUnit.MILLISECONDS
+            );
+            this.keepaliveExecutor = keepalive;
 
             int boundLanPort = ss.getLocalPort();
             int boundUdpPort = udpDiscoveryResponder.start(udpPort, boundLanPort, serverCert.sha256Hex());
@@ -143,9 +172,11 @@ public class DynamicLanTlsServer {
     }
 
     public boolean sendTaskCompleted(String conversationTitle, String taskSummary) {
-        WsClientConnection conn = this.activeWsConnection;
+        if (sessionRegistry.getState() != SessionStateRegistry.State.ACTIVE_SESSION) {
+            return false;
+        }
         Optional<byte[]> hmacKeyOpt = sessionRegistry.getSessionHmacKeyCopy();
-        if (conn == null || !conn.isOpen() || hmacKeyOpt.isEmpty()) {
+        if (hmacKeyOpt.isEmpty()) {
             return false;
         }
         byte[] hmacKey = hmacKeyOpt.get();
@@ -154,12 +185,25 @@ public class DynamicLanTlsServer {
                     "conversationTitle", conversationTitle == null ? "" : conversationTitle,
                     "taskSummary", taskSummary == null ? "" : taskSummary
             ));
-            SignedEnvelope env = crypto.signEnvelope(hmacKey, "TASK_COMPLETED", payloadJson);
-            return conn.sendTextFrame(mapper.writeValueAsString(env));
+            String eventId = UUID.randomUUID().toString();
+            SignedEnvelope env = crypto.signEnvelopeAt(hmacKey, "TASK_COMPLETED", payloadJson, eventId, System.currentTimeMillis());
+            String envelopeJson = mapper.writeValueAsString(env);
+            if (envelopeJson.getBytes(StandardCharsets.UTF_8).length > MAX_WS_FRAME_BYTES) {
+                return false;
+            }
+
+            WsClientConnection conn = this.activeWsConnection;
+            if (conn != null && conn.isOpen() && conn.sendTextFrame(envelopeJson)) {
+                return true;
+            }
+
+            // Paired phone is momentarily reconnecting over Wi-Fi; buffer within active session for instant replay!
+            this.pendingTaskAlert = new PendingTaskAlert(eventId, payloadJson, System.currentTimeMillis());
+            return true;
         } catch (Exception e) {
             return false;
         } finally {
-            java.util.Arrays.fill(hmacKey, (byte) 0);
+            Arrays.fill(hmacKey, (byte) 0);
         }
     }
 
@@ -175,7 +219,7 @@ public class DynamicLanTlsServer {
             } catch (Exception ignored) {
                 // Best effort flush before socket close
             } finally {
-                java.util.Arrays.fill(hmacKey, (byte) 0);
+                Arrays.fill(hmacKey, (byte) 0);
             }
         }
         stopImmediately();
@@ -183,6 +227,12 @@ public class DynamicLanTlsServer {
 
     public synchronized void stopImmediately() {
         udpDiscoveryResponder.stop();
+        this.pendingTaskAlert = null;
+        ScheduledExecutorService keepalive = this.keepaliveExecutor;
+        this.keepaliveExecutor = null;
+        if (keepalive != null) {
+            keepalive.shutdownNow();
+        }
         WsClientConnection ws = this.activeWsConnection;
         this.activeWsConnection = null;
         if (ws != null) {
@@ -211,6 +261,16 @@ public class DynamicLanTlsServer {
 
     public void setOnRemoteNuclearTeardown(Runnable callback) {
         this.onRemoteNuclearTeardown = callback;
+    }
+
+    private void sendServerKeepalivePing() {
+        if (!isListening() || sessionRegistry.getState() != SessionStateRegistry.State.ACTIVE_SESSION) {
+            return;
+        }
+        WsClientConnection conn = this.activeWsConnection;
+        if (conn != null && conn.isOpen()) {
+            conn.sendPingFrame("blipper-keepalive".getBytes(StandardCharsets.UTF_8));
+        }
     }
 
     private void acceptLoop(ServerSocket ss) {
@@ -243,8 +303,10 @@ public class DynamicLanTlsServer {
         }
 
         SSLSocket sslSocket = null;
+        boolean peerVerifiedAsPinnedDevice = false;
         try {
-            rawSocket.setSoTimeout(10_000);
+            rawSocket.setKeepAlive(true);
+            rawSocket.setSoTimeout(12_000);
             SessionStateRegistry.State currentState = sessionRegistry.getState();
             if (currentState == SessionStateRegistry.State.CLOSED) {
                 emitIntrusion(IntrusionEvent.IntrusionType.UNAUTHORIZED_TOUCH, remoteIp, remotePort,
@@ -271,12 +333,16 @@ public class DynamicLanTlsServer {
                 return;
             }
 
+            peerVerifiedAsPinnedDevice = sessionRegistry.isPinnedClientCertificate(peerCert);
+
             InputStream in = sslSocket.getInputStream();
             OutputStream out = sslSocket.getOutputStream();
             ParsedHttpRequest req = readHttpRequest(in);
             if (req == null) {
-                emitIntrusion(IntrusionEvent.IntrusionType.UNAUTHORIZED_TOUCH, remoteIp, remotePort,
-                        "Empty or malformed HTTP request over TLS", false);
+                if (!peerVerifiedAsPinnedDevice && isListening()) {
+                    emitIntrusion(IntrusionEvent.IntrusionType.UNAUTHORIZED_TOUCH, remoteIp, remotePort,
+                            "Empty or malformed HTTP request over TLS", false);
+                }
                 closeQuietly(sslSocket);
                 return;
             }
@@ -292,12 +358,17 @@ public class DynamicLanTlsServer {
                 closeQuietly(sslSocket);
             }
         } catch (SSLHandshakeException handshakeEx) {
-            emitIntrusion(IntrusionEvent.IntrusionType.TLS_HANDSHAKE_FAILED, remoteIp, remotePort,
-                    "TLS 1.3 handshake rejected: " + handshakeEx.getMessage(), false);
+            if (isListening()) {
+                emitIntrusion(IntrusionEvent.IntrusionType.TLS_HANDSHAKE_FAILED, remoteIp, remotePort,
+                        "TLS 1.3 handshake rejected: " + handshakeEx.getMessage(), false);
+            }
             closeQuietly(sslSocket != null ? sslSocket : rawSocket);
         } catch (Exception ex) {
-            emitIntrusion(IntrusionEvent.IntrusionType.TLS_HANDSHAKE_FAILED, remoteIp, remotePort,
-                    "Connection aborted before authentication: " + ex.getClass().getSimpleName(), false);
+            // Do NOT fire fake intrusion alarms if server is stopping or if the already-pinned phone dropped mid-socket
+            if (isListening() && !peerVerifiedAsPinnedDevice) {
+                emitIntrusion(IntrusionEvent.IntrusionType.TLS_HANDSHAKE_FAILED, remoteIp, remotePort,
+                        "Connection aborted before authentication: " + ex.getClass().getSimpleName(), false);
+            }
             closeQuietly(sslSocket != null ? sslSocket : rawSocket);
         }
     }
@@ -348,7 +419,7 @@ public class DynamicLanTlsServer {
                 ));
                 writeHttpResponse(out, 200, json);
             } finally {
-                java.util.Arrays.fill(hmacKeyCopy, (byte) 0);
+                Arrays.fill(hmacKeyCopy, (byte) 0);
             }
         } finally {
             closeQuietly(sslSocket);
@@ -393,7 +464,9 @@ public class DynamicLanTlsServer {
                 + "Upgrade: websocket\r\n"
                 + "Connection: Upgrade\r\n"
                 + "Sec-WebSocket-Accept: " + acceptHash + "\r\n\r\n";
-        sslSocket.setSoTimeout(35_000);
+        sslSocket.setKeepAlive(true);
+        sslSocket.setSoTimeout(WS_READ_TIMEOUT_MS);
+
         WsClientConnection previous = this.activeWsConnection;
         WsClientConnection current = new WsClientConnection(sslSocket, out);
         this.activeWsConnection = current;
@@ -402,23 +475,29 @@ public class DynamicLanTlsServer {
         }
         sessionRegistry.recordHeartbeat();
 
-        // FULL PARANOIA MODE: Fire alert and register active stream BEFORE flushing 101 Switching Protocols
-        String deviceLabel = sessionRegistry.getActiveSessionSnapshot()
-                .map(SessionStateRegistry.ActiveSessionSnapshot::deviceName)
-                .orElse("Paired-Android");
-        emitIntrusion(
-                IntrusionEvent.IntrusionType.AUTHENTICATED_DEVICE_CONNECT,
-                remoteIp,
-                remotePort,
-                "Doğrulanmış cihaz bağlandı: " + deviceLabel,
-                true
-        );
+        // Emit Full Paranoia confirmation ONCE when a newly paired session attaches (never spam on Wi-Fi auto-reconnects)
+        long gen = sessionRegistry.getActiveGeneration();
+        if (gen > 0 && lastAlertedGeneration.getAndSet(gen) != gen) {
+            String deviceLabel = sessionRegistry.getActiveSessionSnapshot()
+                    .map(SessionStateRegistry.ActiveSessionSnapshot::deviceName)
+                    .orElse("Paired-Android");
+            emitIntrusion(
+                    IntrusionEvent.IntrusionType.AUTHENTICATED_DEVICE_CONNECT,
+                    remoteIp,
+                    remotePort,
+                    "Doğrulanmış cihaz bağlandı: " + deviceLabel,
+                    true
+            );
+        }
 
-        out.write(upgradeResp.getBytes(StandardCharsets.UTF_8));
-        out.flush();
-
+        // All post-authentication I/O is isolated so normal mobile Wi-Fi disconnects NEVER trigger TLS_HANDSHAKE_FAILED
         try {
+            out.write(upgradeResp.getBytes(StandardCharsets.UTF_8));
+            out.flush();
+            flushPendingTaskAlertIfPresent(current);
             readWebSocketLoop(current, in, remoteIp, remotePort);
+        } catch (IOException ignored) {
+            // Paired phone closed or roamed Wi-Fi; keep session active so phone can auto-reconnect seamlessly
         } finally {
             if (this.activeWsConnection == current) {
                 this.activeWsConnection = null;
@@ -427,12 +506,44 @@ public class DynamicLanTlsServer {
         }
     }
 
+    private void flushPendingTaskAlertIfPresent(WsClientConnection conn) {
+        PendingTaskAlert pending = this.pendingTaskAlert;
+        if (pending == null) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        if ((now - pending.createdAtMs()) > PENDING_TASK_BUFFER_TTL_MS) {
+            this.pendingTaskAlert = null;
+            return;
+        }
+        Optional<byte[]> hmacKeyOpt = sessionRegistry.getSessionHmacKeyCopy();
+        if (hmacKeyOpt.isEmpty()) {
+            return;
+        }
+        byte[] hmacKey = hmacKeyOpt.get();
+        try {
+            SignedEnvelope env = crypto.signEnvelopeAt(
+                    hmacKey,
+                    "TASK_COMPLETED",
+                    pending.payloadJson(),
+                    pending.eventId(),
+                    now
+            );
+            if (conn.sendTextFrame(mapper.writeValueAsString(env))) {
+                this.pendingTaskAlert = null;
+            }
+        } catch (Exception ignored) {
+        } finally {
+            Arrays.fill(hmacKey, (byte) 0);
+        }
+    }
+
     private void readWebSocketLoop(
             WsClientConnection conn,
             InputStream in,
             String remoteIp,
             int remotePort
-    ) throws Exception {
+    ) throws IOException {
         while (conn.isOpen() && isListening()) {
             WsFrame frame = readClientWsFrame(in);
             if (frame == null || frame.opcode == 0x8) {
@@ -468,6 +579,14 @@ public class DynamicLanTlsServer {
                 if ("HEARTBEAT".equals(env.type())) {
                     SignedEnvelope ack = crypto.signEnvelope(hmacKey, "HEARTBEAT_ACK", "{}");
                     conn.sendTextFrame(mapper.writeValueAsString(ack));
+                } else if ("TASK_ACK".equals(env.type())) {
+                    PendingTaskAlert pending = this.pendingTaskAlert;
+                    if (pending != null) {
+                        JsonNode ackNode = mapper.readTree(env.payloadJson());
+                        if (pending.eventId().equals(ackNode.path("ackedEventId").asText(""))) {
+                            this.pendingTaskAlert = null;
+                        }
+                    }
                 } else if ("NUCLEAR_TEARDOWN".equals(env.type())) {
                     Runnable cb = this.onRemoteNuclearTeardown;
                     if (cb != null) {
@@ -477,7 +596,7 @@ public class DynamicLanTlsServer {
                     return;
                 }
             } finally {
-                java.util.Arrays.fill(hmacKey, (byte) 0);
+                Arrays.fill(hmacKey, (byte) 0);
             }
         }
     }
@@ -538,6 +657,7 @@ public class DynamicLanTlsServer {
             boolean authorized
     ) {
         Optional<NetworkFingerprint> netOpt = networkService.getApprovedNetwork()
+                .or(networkService::getCachedSnapshot)
                 .or(networkService::readCurrentNetwork);
         String profile = netOpt.map(NetworkFingerprint::profileName).orElse("UNKNOWN");
         String mac = netOpt.map(NetworkFingerprint::gatewayMac).orElse("UNKNOWN");
@@ -615,6 +735,9 @@ public class DynamicLanTlsServer {
             }
         }
         byte[] body = contentLength > 0 ? in.readNBytes(contentLength) : new byte[0];
+        if (body.length != contentLength) {
+            throw new EOFException("Incomplete HTTP request body");
+        }
         return new ParsedHttpRequest(requestLine[0], requestLine[1], headers, body);
     }
 
@@ -645,17 +768,31 @@ public class DynamicLanTlsServer {
         boolean masked = (b1 & 0x80) != 0;
         long len = b1 & 0x7F;
         if (len == 126) {
-            len = ((in.read() & 0xFF) << 8) | (in.read() & 0xFF);
+            byte[] ext = in.readNBytes(2);
+            if (ext.length != 2) {
+                throw new EOFException("Truncated 16-bit WebSocket frame length");
+            }
+            len = ((ext[0] & 0xFF) << 8) | (ext[1] & 0xFF);
         } else if (len == 127) {
+            byte[] ext = in.readNBytes(8);
+            if (ext.length != 8) {
+                throw new EOFException("Truncated 64-bit WebSocket frame length");
+            }
             len = 0;
             for (int i = 0; i < 8; i++) {
-                len = (len << 8) | (in.read() & 0xFF);
+                len = (len << 8) | (ext[i] & 0xFF);
             }
         }
         if (len < 0 || len > MAX_WS_FRAME_BYTES) {
             throw new IOException("WebSocket frame exceeds max allowed size");
         }
-        byte[] maskKey = masked ? in.readNBytes(4) : null;
+        byte[] maskKey = null;
+        if (masked) {
+            maskKey = in.readNBytes(4);
+            if (maskKey.length != 4) {
+                throw new EOFException("Truncated WebSocket mask key");
+            }
+        }
         byte[] payload = in.readNBytes((int) len);
         if (payload.length != (int) len) {
             throw new EOFException("Incomplete WebSocket payload");
@@ -681,6 +818,10 @@ public class DynamicLanTlsServer {
             return sendFrame(0x81, text.getBytes(StandardCharsets.UTF_8));
         }
 
+        synchronized void sendPingFrame(byte[] payload) {
+            sendFrame(0x89, payload == null ? new byte[0] : payload);
+        }
+
         synchronized void sendPongFrame(byte[] payload) {
             sendFrame(0x8A, payload == null ? new byte[0] : payload);
         }
@@ -690,7 +831,7 @@ public class DynamicLanTlsServer {
         }
 
         private synchronized boolean sendFrame(int firstByte, byte[] payload) {
-            if (!isOpen() || payload == null || payload.length > 65535) {
+            if (!isOpen() || payload == null || payload.length > MAX_WS_FRAME_BYTES) {
                 return false;
             }
             try {

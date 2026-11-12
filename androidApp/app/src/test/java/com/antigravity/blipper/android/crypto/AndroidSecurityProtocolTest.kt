@@ -1,5 +1,6 @@
 package com.antigravity.blipper.android.crypto
 
+import com.antigravity.blipper.android.network.BlipperSecureWsClient
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -10,8 +11,13 @@ import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.io.EOFException
+import java.net.SocketException
+import java.net.SocketTimeoutException
+import java.security.cert.CertificateException
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicInteger
+import javax.net.ssl.SSLHandshakeException
 
 class AndroidSecurityProtocolTest {
 
@@ -89,5 +95,68 @@ class AndroidSecurityProtocolTest {
         assertEquals(1, cleanupCount.get())
         assertFalse(store.state.value.connected)
         assertNull(store.copyHmacKey())
+    }
+
+    @Test
+    fun `transient Wi-Fi socket drop preserves session for auto-reconnect while auth or TLS rejection wipes keys`() {
+        // Transient Wi-Fi roam / TCP reset / Doze wakeup timeout while session TTL is valid -> MUST NOT terminate session!
+        assertFalse(
+            BlipperSecureWsClient.shouldTerminateSessionOnFailure(
+                throwable = SocketException("Connection reset"),
+                httpStatusCode = null,
+                sessionExpired = false,
+                explicitTeardownRequested = false
+            )
+        )
+        assertFalse(
+            BlipperSecureWsClient.shouldTerminateSessionOnFailure(
+                throwable = SocketTimeoutException("sent ping but didn't receive pong"),
+                httpStatusCode = null,
+                sessionExpired = false,
+                explicitTeardownRequested = false
+            )
+        )
+        assertFalse(
+            BlipperSecureWsClient.shouldTerminateSessionOnFailure(
+                throwable = EOFException(),
+                httpStatusCode = null,
+                sessionExpired = false,
+                explicitTeardownRequested = false
+            )
+        )
+
+        // Terminal security events (HTTP 401/403, TLS cert mismatch, expired TTL, explicit teardown) -> MUST wipe immediately!
+        assertTrue(
+            BlipperSecureWsClient.shouldTerminateSessionOnFailure(
+                throwable = SocketException("Rejected"),
+                httpStatusCode = 403,
+                sessionExpired = false,
+                explicitTeardownRequested = false
+            )
+        )
+        assertTrue(
+            BlipperSecureWsClient.shouldTerminateSessionOnFailure(
+                throwable = SSLHandshakeException("Desktop TLS certificate fingerprint mismatch!"),
+                httpStatusCode = null,
+                sessionExpired = false,
+                explicitTeardownRequested = false
+            )
+        )
+        assertTrue(
+            BlipperSecureWsClient.shouldTerminateSessionOnFailure(
+                throwable = CertificateException("Untrusted cert"),
+                httpStatusCode = null,
+                sessionExpired = false,
+                explicitTeardownRequested = false
+            )
+        )
+        assertTrue(
+            BlipperSecureWsClient.shouldTerminateSessionOnFailure(
+                throwable = SocketException("Any"),
+                httpStatusCode = null,
+                sessionExpired = true,
+                explicitTeardownRequested = false
+            )
+        )
     }
 }

@@ -69,7 +69,7 @@ public class NuclearTeardownCoordinator {
         return entry;
     }
 
-    @Scheduled(fixedDelay = 3000L)
+    @Scheduled(fixedDelay = 4000L)
     public void runWatchdogTick() {
         boolean serverOpen = lanServer.isListening();
         SessionStateRegistry.State state = sessionRegistry.getState();
@@ -78,7 +78,7 @@ public class NuclearTeardownCoordinator {
         }
 
         long now = System.currentTimeMillis();
-        if (!networkService.isCurrentNetworkTrusted()) {
+        if (!networkService.isCurrentNetworkTrustedForWatchdog()) {
             auditLogger.appendTamperEvidentLog(
                     "NETWORK_DRIFT_AUTO_SHUTDOWN",
                     "local",
@@ -96,10 +96,6 @@ public class NuclearTeardownCoordinator {
         }
         if (sessionRegistry.isSessionTtlExpired(now)) {
             executeTeardownInternal("SESSION_TTL_EXPIRED", true);
-            return;
-        }
-        if (sessionRegistry.isHeartbeatExpired(now)) {
-            executeTeardownInternal("HEARTBEAT_30S_DEADMAN_TIMEOUT", false);
         }
     }
 

@@ -10,6 +10,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -26,13 +27,17 @@ import okhttp3.WebSocketListener
 import org.json.JSONObject
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
+import java.security.cert.CertificateException
 import java.security.cert.X509Certificate
 import java.util.Arrays
 import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
+import javax.net.ssl.SSLHandshakeException
+import javax.net.ssl.SSLPeerUnverifiedException
 
 class BlipperSecureWsClient(
     private val cryptoEngine: PairingCryptoEngine,
@@ -43,13 +48,43 @@ class BlipperSecureWsClient(
 ) {
 
     companion object {
-        private const val HEARTBEAT_INTERVAL_MS = 12_000L
-        private const val DEADMAN_TIMEOUT_MS = 30_000L
+        private const val HEARTBEAT_INTERVAL_MS = 18_000L
+        private val RECONNECT_BACKOFF_MS = longArrayOf(1_000L, 2_000L, 3_500L, 5_000L)
+
+        fun shouldTerminateSessionOnFailure(
+            throwable: Throwable?,
+            httpStatusCode: Int?,
+            sessionExpired: Boolean,
+            explicitTeardownRequested: Boolean
+        ): Boolean {
+            if (explicitTeardownRequested || sessionExpired) {
+                return true
+            }
+            if (httpStatusCode == 401 || httpStatusCode == 403) {
+                return true
+            }
+            var cur: Throwable? = throwable
+            var depth = 0
+            while (cur != null && depth < 8) {
+                if (cur is SSLHandshakeException ||
+                    cur is SSLPeerUnverifiedException ||
+                    cur is CertificateException ||
+                    cur is SecurityException
+                ) {
+                    return true
+                }
+                cur = cur.cause
+                depth++
+            }
+            return false
+        }
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val teardownGuard = AtomicBoolean(false)
-    private val lastServerActivityMs = AtomicLong(0L)
+    private val reconnectingGuard = AtomicBoolean(false)
+    private val reconnectAttempt = AtomicInteger(0)
+    private val connectionSeq = AtomicLong(0L)
 
     @Volatile
     private var okHttpClient: OkHttpClient? = null
@@ -60,6 +95,15 @@ class BlipperSecureWsClient(
     @Volatile
     private var watchdogJob: Job? = null
 
+    @Volatile
+    private var reconnectJob: Job? = null
+
+    @Volatile
+    private var sessionHost: String = ""
+
+    @Volatile
+    private var sessionPort: Int = 0
+
     suspend fun pairAndConnect(
         host: String,
         tlsPort: Int,
@@ -67,6 +111,8 @@ class BlipperSecureWsClient(
         pinCode: String
     ): Result<Unit> = withContext(Dispatchers.IO) {
         teardownGuard.set(false)
+        reconnectingGuard.set(false)
+        reconnectAttempt.set(0)
         val cleanPin = pinCode.trim()
         if (cleanPin.length < 6) {
             return@withContext Result.failure(IllegalArgumentException("Eşleştirme kodu en az 6 haneli olmalıdır."))
@@ -92,9 +138,9 @@ class BlipperSecureWsClient(
                         .toByteArray(StandardCharsets.UTF_8)
                     MessageDigest.isEqual(expectedPinUtf8, actualUtf8)
                 }
-                .connectTimeout(6, TimeUnit.SECONDS)
+                .connectTimeout(8, TimeUnit.SECONDS)
                 .readTimeout(0, TimeUnit.MILLISECONDS)
-                .pingInterval(15, TimeUnit.SECONDS)
+                .pingInterval(25, TimeUnit.SECONDS)
                 .build()
             this@BlipperSecureWsClient.okHttpClient = client
 
@@ -118,6 +164,7 @@ class BlipperSecureWsClient(
 
             val pairReq = Request.Builder()
                 .url("https://$host:$tlsPort/api/v1/pair/complete")
+                .header("Connection", "close")
                 .post(reqJson.toRequestBody("application/json; charset=utf-8".toMediaType()))
                 .build()
 
@@ -155,6 +202,9 @@ class BlipperSecureWsClient(
                 ?: throw SecurityException("Geçersiz oturum anahtarı")
             val sessionExpiresAtMs = respJson.optLong("sessionExpiresAtMs", Long.MAX_VALUE)
 
+            this@BlipperSecureWsClient.sessionHost = host
+            this@BlipperSecureWsClient.sessionPort = tlsPort
+
             try {
                 sessionStore.activateSession(
                     desktopHost = host,
@@ -168,6 +218,7 @@ class BlipperSecureWsClient(
                 Arrays.fill(hmacKey, 0.toByte())
             }
 
+            startSessionTtlAndHeartbeatWatchdog()
             openAuthenticatedWebSocket(client, host, tlsPort, bearerToken)
             Result.success(Unit)
         } catch (e: Exception) {
@@ -185,7 +236,10 @@ class BlipperSecureWsClient(
         tlsPort: Int,
         bearerToken: String
     ) {
-        lastServerActivityMs.set(System.currentTimeMillis())
+        if (teardownGuard.get()) {
+            return
+        }
+        val seq = connectionSeq.incrementAndGet()
         val wsReq = Request.Builder()
             .url("wss://$host:$tlsPort/ws/v1/stream")
             .header("Authorization", "Bearer $bearerToken")
@@ -193,27 +247,102 @@ class BlipperSecureWsClient(
 
         activeWebSocket = client.newWebSocket(wsReq, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
-                lastServerActivityMs.set(System.currentTimeMillis())
-                startHeartbeatAndWatchdog()
+                if (connectionSeq.get() != seq || teardownGuard.get()) {
+                    runCatching { webSocket.close(1000, null) }
+                    return
+                }
+                reconnectAttempt.set(0)
+                reconnectingGuard.set(false)
+                sessionStore.updateLiveStreamStatus("🟢 mTLS 1.3 Şifreli Bağlı ($host:$tlsPort)")
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
-                handleIncomingEnvelope(webSocket, text)
+                if (connectionSeq.get() == seq) {
+                    handleIncomingEnvelope(webSocket, text)
+                }
             }
 
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
-                webSocket.close(1000, null)
-                triggerLocalCleanupAndNotify("WS_CLOSING")
+                runCatching { webSocket.close(1000, null) }
+                if (reason == "NUCLEAR_TEARDOWN" || teardownGuard.get()) {
+                    triggerLocalCleanupAndNotify("WS_REMOTE_NUCLEAR_CLOSE")
+                } else if (connectionSeq.get() == seq) {
+                    handleTransientOrTerminalDisconnect(null, null)
+                }
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                triggerLocalCleanupAndNotify("WS_CLOSED")
+                if (reason == "NUCLEAR_TEARDOWN" || teardownGuard.get()) {
+                    triggerLocalCleanupAndNotify("WS_CLOSED")
+                } else if (connectionSeq.get() == seq) {
+                    handleTransientOrTerminalDisconnect(null, null)
+                }
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                triggerLocalCleanupAndNotify("WS_FAILURE")
+                if (connectionSeq.get() == seq) {
+                    handleTransientOrTerminalDisconnect(t, response?.code)
+                }
             }
         })
+    }
+
+    private fun handleTransientOrTerminalDisconnect(throwable: Throwable?, httpStatusCode: Int?) {
+        val expired = sessionStore.isExpired(System.currentTimeMillis())
+        if (shouldTerminateSessionOnFailure(
+                throwable = throwable,
+                httpStatusCode = httpStatusCode,
+                sessionExpired = expired,
+                explicitTeardownRequested = teardownGuard.get()
+            )
+        ) {
+            if (expired) {
+                sendNuclearTeardownAndClose("ANDROID_TTL_EXPIRED")
+            } else {
+                val reason = if (httpStatusCode != null) "DESKTOP_HTTP_$httpStatusCode" else "DESKTOP_SESSION_CLOSED"
+                triggerLocalCleanupAndNotify(reason)
+            }
+            return
+        }
+        scheduleReconnect()
+    }
+
+    private fun scheduleReconnect() {
+        if (teardownGuard.get() || !sessionStore.state.value.connected) {
+            return
+        }
+        if (!reconnectingGuard.compareAndSet(false, true)) {
+            return
+        }
+        sessionStore.updateLiveStreamStatus("🔄 mTLS 1.3 Otomatik Yeniden Bağlanıyor ($sessionHost:$sessionPort)...")
+        reconnectJob?.cancel()
+        reconnectJob = scope.launch {
+            if (isActive && !teardownGuard.get() && sessionStore.state.value.connected) {
+                if (sessionStore.isExpired(System.currentTimeMillis())) {
+                    reconnectingGuard.set(false)
+                    sendNuclearTeardownAndClose("ANDROID_TTL_EXPIRED")
+                    return@launch
+                }
+                val idx = reconnectAttempt.getAndIncrement().coerceAtMost(RECONNECT_BACKOFF_MS.lastIndex)
+                delay(RECONNECT_BACKOFF_MS[idx])
+                if (teardownGuard.get() || !sessionStore.state.value.connected) {
+                    reconnectingGuard.set(false)
+                    return@launch
+                }
+                val client = okHttpClient
+                val token = sessionStore.readBearerToken()
+                if (client == null || token.isNullOrBlank()) {
+                    reconnectingGuard.set(false)
+                    triggerLocalCleanupAndNotify("MISSING_RECONNECT_MATERIAL")
+                    return@launch
+                }
+                runCatching { activeWebSocket?.cancel() }
+                reconnectingGuard.set(false)
+                openAuthenticatedWebSocket(client, sessionHost, sessionPort, token)
+                return@launch
+            }
+            reconnectingGuard.set(false)
+        }
     }
 
     private fun handleIncomingEnvelope(webSocket: WebSocket, rawText: String) {
@@ -223,11 +352,21 @@ class BlipperSecureWsClient(
         }
         try {
             val env = SignedEnvelopeModel.fromJsonString(rawText)
-            if (!cryptoEngine.verifyEnvelope(hmacKey, env)) {
-                sendNuclearTeardownAndClose("ENVELOPE_VERIFICATION_FAILED")
-                return
+            when (cryptoEngine.verifyEnvelopeDetailed(hmacKey, env)) {
+                PairingCryptoEngine.EnvelopeVerificationResult.INVALID_OR_TAMPERED -> {
+                    sendNuclearTeardownAndClose("ENVELOPE_VERIFICATION_FAILED")
+                    return
+                }
+                PairingCryptoEngine.EnvelopeVerificationResult.DUPLICATE_ALREADY_PROCESSED -> {
+                    if (env.type == "TASK_COMPLETED") {
+                        val ackPayload = JSONObject().put("ackedEventId", env.eventId).toString()
+                        val ackEnv = cryptoEngine.signEnvelope(hmacKey, "TASK_ACK", ackPayload)
+                        webSocket.send(ackEnv.toJsonString())
+                    }
+                    return
+                }
+                PairingCryptoEngine.EnvelopeVerificationResult.ACCEPTED_NEW -> Unit
             }
-            lastServerActivityMs.set(System.currentTimeMillis())
 
             when (env.type) {
                 "HEARTBEAT_ACK" -> Unit
@@ -253,24 +392,21 @@ class BlipperSecureWsClient(
         }
     }
 
-    private fun startHeartbeatAndWatchdog() {
+    private fun startSessionTtlAndHeartbeatWatchdog() {
         watchdogJob?.cancel()
         watchdogJob = scope.launch {
-            while (isActive && sessionStore.state.value.connected) {
+            while (isActive && sessionStore.state.value.connected && !teardownGuard.get()) {
                 delay(HEARTBEAT_INTERVAL_MS)
                 val now = System.currentTimeMillis()
                 if (sessionStore.isExpired(now)) {
                     sendNuclearTeardownAndClose("ANDROID_TTL_EXPIRED")
                     return@launch
                 }
-                if (now - lastServerActivityMs.get() > DEADMAN_TIMEOUT_MS) {
-                    sendNuclearTeardownAndClose("ANDROID_DEADMAN_30S_TIMEOUT")
-                    return@launch
-                }
+                val ws = activeWebSocket ?: continue
                 val hmacKey = sessionStore.copyHmacKey() ?: continue
                 try {
                     val hb = cryptoEngine.signEnvelope(hmacKey, "HEARTBEAT", "{}")
-                    activeWebSocket?.send(hb.toJsonString())
+                    ws.send(hb.toJsonString())
                 } finally {
                     Arrays.fill(hmacKey, 0.toByte())
                 }
@@ -284,6 +420,8 @@ class BlipperSecureWsClient(
         }
         watchdogJob?.cancel()
         watchdogJob = null
+        reconnectJob?.cancel()
+        reconnectJob = null
 
         val ws = activeWebSocket
         val hmacKey = sessionStore.copyHmacKey()
@@ -310,6 +448,8 @@ class BlipperSecureWsClient(
         }
         watchdogJob?.cancel()
         watchdogJob = null
+        reconnectJob?.cancel()
+        reconnectJob = null
         shutdownTransportAndWipe(reason)
     }
 
@@ -321,6 +461,7 @@ class BlipperSecureWsClient(
             runCatching { client.connectionPool.evictAll() }
         }
         okHttpClient = null
+        scope.cancel()
         cryptoEngine.clearReplayCache()
         hardwareKeyManager.wipeAllKeys()
         sessionStore.wipeEverything()

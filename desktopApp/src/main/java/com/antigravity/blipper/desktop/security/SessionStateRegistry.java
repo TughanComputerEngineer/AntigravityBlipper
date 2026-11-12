@@ -211,6 +211,10 @@ public class SessionStateRegistry {
         }
     }
 
+    public synchronized void setLastHeartbeatForTest(long timestampMs) {
+        this.lastHeartbeatMs = timestampMs;
+    }
+
     public synchronized boolean isPairingExpired(long nowMs) {
         return state == State.PAIRING_WINDOW && nowMs > pairingExpiresAtMs;
     }

@@ -28,7 +28,7 @@ import java.util.function.Consumer;
 
 public final class IntrusionAlertWindow {
 
-    public static final String KILL_BUTTON_LABEL = "🛑 LOGLA VE PORTU ANINDA KAPAT";
+    public static final String KILL_BUTTON_LABEL = "[!] LOGLA VE PORTU ANINDA KAPAT";
 
     private static final DateTimeFormatter TIME_FMT =
             DateTimeFormatter.ofPattern("dd.MM.yyyy HH:mm:ss").withZone(ZoneId.systemDefault());
@@ -45,8 +45,8 @@ public final class IntrusionAlertWindow {
     public static AlertViewModel buildAlertViewModel(IntrusionEvent event) {
         boolean authConnect = event != null && event.authorizedConnection();
         String headline = authConnect
-                ? "🚨 GÜVENLİK ALARMI — PORTA CİHAZ BAĞLANDI! 🚨"
-                : "🚨 GÜVENLİK ALARMI — TANINMAYAN PORT ERİŞİM GİRİŞİMİ! 🚨";
+                ? "⚠ GÜVENLİK ALARMI — PORTA CİHAZ BAĞLANDI! ⚠"
+                : "⚠ GÜVENLİK ALARMI — TANINMAYAN PORT ERİŞİM GİRİŞİMİ! ⚠";
         String subtitle = authConnect
                 ? "Şifreli mTLS portuna bir cihaz bağlandı. Bu bağlantıyı sen başlatmadıysan derhal aşağıdaki dev butona bas!"
                 : "Tanınmayan bir cihaz Blipper LAN portuna dokundu ve reddedildi! Portu tamamen kapatmak için aşağıdaki dev butona bas!";

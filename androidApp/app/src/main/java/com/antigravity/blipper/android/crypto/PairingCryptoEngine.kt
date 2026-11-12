@@ -46,6 +46,12 @@ data class SignedEnvelopeModel(
 
 class PairingCryptoEngine {
 
+    enum class EnvelopeVerificationResult {
+        ACCEPTED_NEW,
+        DUPLICATE_ALREADY_PROCESSED,
+        INVALID_OR_TAMPERED
+    }
+
     companion object {
         const val PBKDF2_ITERATIONS = 210_000
         const val ALLOWED_CLOCK_SKEW_MS = 30_000L
@@ -129,35 +135,43 @@ class PairingCryptoEngine {
     }
 
     fun verifyEnvelope(hmacKey: ByteArray, envelope: SignedEnvelopeModel): Boolean {
+        return verifyEnvelopeDetailed(hmacKey, envelope) == EnvelopeVerificationResult.ACCEPTED_NEW
+    }
+
+    fun verifyEnvelopeDetailed(
+        hmacKey: ByteArray,
+        envelope: SignedEnvelopeModel
+    ): EnvelopeVerificationResult {
         if (hmacKey.size < 32 || envelope.eventId.isBlank() || envelope.hmacHex.isBlank()) {
-            return false
+            return EnvelopeVerificationResult.INVALID_OR_TAMPERED
         }
         val now = System.currentTimeMillis()
         if (abs(now - envelope.timestampMs) > ALLOWED_CLOCK_SKEW_MS) {
-            return false
+            return EnvelopeVerificationResult.INVALID_OR_TAMPERED
         }
-        val candidateMac = envelope.hmacHex.decodeHexOrNull() ?: return false
+        val candidateMac = envelope.hmacHex.decodeHexOrNull()
+            ?: return EnvelopeVerificationResult.INVALID_OR_TAMPERED
         val expectedMac = hmacSha256(
             hmacKey,
             envelope.canonicalSigningInput().toByteArray(StandardCharsets.UTF_8)
         )
         if (!MessageDigest.isEqual(expectedMac, candidateMac)) {
-            return false
+            return EnvelopeVerificationResult.INVALID_OR_TAMPERED
         }
         synchronized(replayLock) {
             val iter = seenEventIds.entries.iterator()
             while (iter.hasNext()) {
                 val entry = iter.next()
-                if (now - entry.value > ALLOWED_CLOCK_SKEW_MS * 2) {
+                if (now - entry.value > ALLOWED_CLOCK_SKEW_MS * 4) {
                     iter.remove()
                 }
             }
             if (seenEventIds.containsKey(envelope.eventId)) {
-                return false
+                return EnvelopeVerificationResult.DUPLICATE_ALREADY_PROCESSED
             }
             seenEventIds[envelope.eventId] = now
         }
-        return true
+        return EnvelopeVerificationResult.ACCEPTED_NEW
     }
 
     fun clearReplayCache() {

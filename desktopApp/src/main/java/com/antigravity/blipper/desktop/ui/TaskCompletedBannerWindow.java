@@ -24,7 +24,7 @@ public final class TaskCompletedBannerWindow {
         String text = (rawBannerText == null || rawBannerText.isBlank())
                 ? "ANTIGRAVITY: Aktif Sohbet: Görev tamamlandı"
                 : rawBannerText.trim();
-        return "⚡  " + text;
+        return "►  " + text;
     }
 
     public static void showBanner(String formattedBannerText) {

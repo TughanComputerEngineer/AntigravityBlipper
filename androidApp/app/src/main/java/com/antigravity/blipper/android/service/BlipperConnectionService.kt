@@ -11,6 +11,7 @@ import android.content.pm.ServiceInfo
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import com.antigravity.blipper.android.alert.AlertBurstEngine
@@ -59,6 +60,7 @@ class BlipperConnectionService : Service() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val stoppingGuard = AtomicBoolean(false)
     private var wifiLock: WifiManager.WifiLock? = null
+    private var cpuWakeLock: PowerManager.WakeLock? = null
 
     @Volatile
     private var wsClient: BlipperSecureWsClient? = null
@@ -202,7 +204,7 @@ class BlipperConnectionService : Service() {
     }
 
     private fun finishShutdownUiAndService(reason: String) {
-        releaseWifiLock()
+        releaseSessionLocks()
         if (BlipperAppGraph.sessionStore.state.value.connected) {
             BlipperAppGraph.sessionStore.wipeEverything(
                 "🔒 Bağlantı Kapatıldı ($reason) — Tüm Anahtarlar İmha Edildi"
@@ -227,15 +229,36 @@ class BlipperConnectionService : Service() {
                 lock.acquire()
             }
         }
+        runCatching {
+            val pm = applicationContext.getSystemService(Context.POWER_SERVICE) as PowerManager
+            val wl = cpuWakeLock ?: pm.newWakeLock(
+                PowerManager.PARTIAL_WAKE_LOCK,
+                "AntigravityBlipper:ActiveMtlsSessionLock"
+            ).apply {
+                setReferenceCounted(false)
+                cpuWakeLock = this
+            }
+            if (!wl.isHeld) {
+                // Keep socket & TLS keepalive responsive during Samsung screen-off Doze (max 24h safety cap)
+                wl.acquire(24L * 60L * 60L * 1000L)
+            }
+        }
     }
 
-    private fun releaseWifiLock() {
+    private fun releaseSessionLocks() {
         runCatching {
             val lock = wifiLock
             if (lock != null && lock.isHeld) {
                 lock.release()
             }
             wifiLock = null
+        }
+        runCatching {
+            val wl = cpuWakeLock
+            if (wl != null && wl.isHeld) {
+                wl.release()
+            }
+            cpuWakeLock = null
         }
     }
 
