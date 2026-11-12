@@ -25,7 +25,7 @@
 
 @rem Set local scope for the variables, and ensure extensions are enabled
 setlocal EnableExtensions
-for %%I in ("%~dp0..\.gradle-home") do set "GRADLE_USER_HOME=%%~fI"
+set "GRADLE_USER_HOME=C:\AntigravityBlipper\.gradle-home"
 
 set DIRNAME=%~dp0
 if "%DIRNAME%"=="" set DIRNAME=.
