@@ -47,6 +47,44 @@ class NetworkAndLoopbackSecurityTest {
     }
 
     @Test
+    void backgroundRefreshRunsOffCallerThreadAndThrottlesRapidUiPolls() throws Exception {
+        java.util.concurrent.atomic.AtomicInteger probeCount = new java.util.concurrent.atomic.AtomicInteger(0);
+        AtomicReference<String> probeThreadName = new AtomicReference<>("");
+        String callerThread = Thread.currentThread().getName();
+
+        var svc = new WindowsNetworkFingerprintService(() -> {
+            probeCount.incrementAndGet();
+            probeThreadName.set(Thread.currentThread().getName());
+            try {
+                Thread.sleep(120L);
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            }
+            return "HomeFiber|Wi-Fi|192.168.1.25|192.168.1.1|AA-BB-CC-11-22-33";
+        });
+
+        long t0 = System.nanoTime();
+        for (int i = 0; i < 10; i++) {
+            svc.requestBackgroundRefreshIfStale(3000L);
+        }
+        long elapsedMs = (System.nanoTime() - t0) / 1_000_000L;
+        assertTrue(elapsedMs < 80L, "UI polling must never block caller/EDT thread on PowerShell probe");
+
+        long deadline = System.currentTimeMillis() + 2000L;
+        while (svc.getCachedSnapshot().isEmpty() && System.currentTimeMillis() < deadline) {
+            Thread.sleep(20L);
+        }
+        NetworkFingerprint cached = svc.getCachedSnapshot().orElseThrow();
+        assertEquals("HomeFiber", cached.profileName());
+        assertEquals(1, probeCount.get(), "10 rapid UI polls within TTL must trigger only 1 probe");
+        assertNotEquals(callerThread, probeThreadName.get(), "Probe must run on background worker, not caller/EDT");
+
+        svc.approveNetworkForCurrentSession(cached);
+        assertTrue(svc.matchesApprovedNetwork(cached));
+        assertEquals(1, probeCount.get(), "matchesApprovedNetwork must evaluate in-memory with 0 extra probes");
+    }
+
+    @Test
     void firewallHelperScopesStrictlyToLocalSubnet() {
         var svc = new WindowsNetworkFingerprintService(() -> "");
         String enableCmd = svc.buildLocalSubnetFirewallScript(58443, 58444, true);

@@ -690,19 +690,17 @@ public class DynamicLanTlsServer {
         }
 
         private synchronized boolean sendFrame(int firstByte, byte[] payload) {
-            if (!isOpen()) {
+            if (!isOpen() || payload == null || payload.length > 65535) {
                 return false;
             }
             try {
                 out.write(firstByte);
                 if (payload.length < 126) {
                     out.write(payload.length);
-                } else if (payload.length <= 65535) {
+                } else {
                     out.write(126);
                     out.write((payload.length >> 8) & 0xFF);
                     out.write(payload.length & 0xFF);
-                } else {
-                    return false;
                 }
                 out.write(payload);
                 out.flush();

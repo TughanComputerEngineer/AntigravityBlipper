@@ -207,6 +207,14 @@ class DynamicLanTlsServerTest {
             assertEquals("TASK_COMPLETED", receivedEnv.type());
             assertTrue(crypto.verifyEnvelope(hmacKey, receivedEnv));
 
+            // Oversized (> 65535 bytes) payload must be rejected WITHOUT writing a stray 0x81 byte that corrupts the stream!
+            assertFalse(server.sendTaskCompleted("Oversized", "X".repeat(70_000)));
+            assertTrue(server.sendTaskCompleted("StreamIntact", "Framing korundu"));
+            String postOversizeFrame = readUnmaskedServerWsTextFrame(in);
+            SignedEnvelope intactEnv = mapper.readValue(postOversizeFrame, SignedEnvelope.class);
+            assertEquals("TASK_COMPLETED", intactEnv.type());
+            assertTrue(crypto.verifyEnvelope(hmacKey, intactEnv));
+
             // Phone sends signed NUCLEAR_TEARDOWN -> Desktop triggers callback & stops port!
             SignedEnvelope teardownEnv = crypto.signEnvelope(hmacKey, "NUCLEAR_TEARDOWN", "{\"reason\":\"PHONE_DISCONNECT\"}");
             writeMaskedClientWsTextFrame(out, mapper.writeValueAsString(teardownEnv));

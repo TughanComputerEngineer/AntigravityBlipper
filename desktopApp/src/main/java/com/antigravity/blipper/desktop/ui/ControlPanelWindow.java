@@ -20,6 +20,7 @@ import javax.swing.JPanel;
 import javax.swing.JSpinner;
 import javax.swing.SpinnerNumberModel;
 import javax.swing.SwingConstants;
+import javax.swing.SwingUtilities;
 import javax.swing.Timer;
 import java.awt.BorderLayout;
 import java.awt.Color;
@@ -32,6 +33,8 @@ import java.util.Optional;
 
 public class ControlPanelWindow extends JFrame {
 
+    private static final long NETWORK_UI_REFRESH_INTERVAL_MS = 4000L;
+
     private final WindowsNetworkFingerprintService networkService;
     private final SessionStateRegistry sessionRegistry;
     private final DynamicLanTlsServer lanServer;
@@ -39,9 +42,10 @@ public class ControlPanelWindow extends JFrame {
     private final LocalHookController localHookController;
     private final int configuredLanPort;
     private final int configuredUdpPort;
+    private final Timer refreshTimer;
 
     private final JLabel statusBadgeLabel = new JLabel("", SwingConstants.CENTER);
-    private final JLabel networkInfoLabel = new JLabel("");
+    private final JLabel networkInfoLabel = new JLabel("Ağ durumu kontrol ediliyor...");
     private final JLabel pinDisplayLabel = new JLabel("PORT KAPALI — Aktif eşleştirme yok", SwingConstants.CENTER);
     private final JSpinner hoursSpinner = new JSpinner(new SpinnerNumberModel(4, 1, 24, 1));
     private final JCheckBox unlimitedCheck = new JCheckBox("Sınırsız Yetki (Oturum Kapanana Kadar)");
@@ -74,15 +78,42 @@ public class ControlPanelWindow extends JFrame {
         setDefaultCloseOperation(JFrame.HIDE_ON_CLOSE);
 
         buildLayout();
-        Timer refreshTimer = new Timer(1000, e -> refreshUiState());
-        refreshTimer.start();
+        this.refreshTimer = new Timer(1000, e -> {
+            networkService.requestBackgroundRefreshIfStale(
+                    NETWORK_UI_REFRESH_INTERVAL_MS,
+                    () -> SwingUtilities.invokeLater(this::refreshUiState)
+            );
+            refreshUiState();
+        });
+        this.refreshTimer.start();
+        networkService.requestBackgroundRefreshIfStale(
+                0L,
+                () -> SwingUtilities.invokeLater(this::refreshUiState)
+        );
         refreshUiState();
     }
 
+    @Override
+    public void dispose() {
+        refreshTimer.stop();
+        super.dispose();
+    }
+
+    JLabel getStatusBadgeLabelForTest() {
+        return statusBadgeLabel;
+    }
+
     public void onNuclearTeardown(String reason) {
-        this.currentPinDisplay = "";
-        this.currentHostPortDisplay = "";
-        refreshUiState();
+        Runnable applyOnEdt = () -> {
+            this.currentPinDisplay = "";
+            this.currentHostPortDisplay = "";
+            refreshUiState();
+        };
+        if (SwingUtilities.isEventDispatchThread()) {
+            applyOnEdt.run();
+        } else {
+            SwingUtilities.invokeLater(applyOnEdt);
+        }
     }
 
     private void buildLayout() {
@@ -106,7 +137,7 @@ public class ControlPanelWindow extends JFrame {
         JPanel netButtons = new JPanel(new FlowLayout(FlowLayout.LEFT, 10, 0));
         JButton approveNetBtn = new JButton("✓ Mevcut Ev Ağını Bu Oturum İçin Onayla");
         approveNetBtn.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
-        approveNetBtn.addActionListener(e -> approveCurrentNetwork());
+        approveNetBtn.addActionListener(e -> approveCurrentNetworkAsync());
 
         JButton fwBtn = new JButton("🛡️ LocalSubnet Güvenlik Duvarı İzni Ekle");
         fwBtn.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
@@ -132,7 +163,7 @@ public class ControlPanelWindow extends JFrame {
         startPairBtn.setBackground(new Color(2, 132, 199));
         startPairBtn.setForeground(Color.WHITE);
         startPairBtn.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
-        startPairBtn.addActionListener(e -> startPairingSession());
+        startPairBtn.addActionListener(e -> startPairingSessionAsync());
         pairCard.add(startPairBtn);
         pairCard.add(Box.createVerticalStrut(12));
 
@@ -200,40 +231,57 @@ public class ControlPanelWindow extends JFrame {
         return p;
     }
 
-    private void approveCurrentNetwork() {
-        Optional<NetworkFingerprint> fpOpt = networkService.readCurrentNetwork();
-        if (fpOpt.isEmpty()) {
-            JOptionPane.showMessageDialog(this,
-                    "Aktif bir ağ geçidi bulunamadı. Wi-Fi veya Ethernet bağlantınızı kontrol edin.",
-                    "Ağ Bulunamadı", JOptionPane.WARNING_MESSAGE);
-            return;
-        }
-        networkService.approveNetworkForCurrentSession(fpOpt.get());
-        refreshUiState();
+    private void approveCurrentNetworkAsync() {
+        Thread worker = new Thread(() -> {
+            Optional<NetworkFingerprint> fpOpt = networkService.readCurrentNetwork();
+            SwingUtilities.invokeLater(() -> {
+                if (fpOpt.isEmpty()) {
+                    JOptionPane.showMessageDialog(this,
+                            "Aktif bir ağ geçidi bulunamadı. Wi-Fi veya Ethernet bağlantınızı kontrol edin.",
+                            "Ağ Bulunamadı", JOptionPane.WARNING_MESSAGE);
+                    return;
+                }
+                networkService.approveNetworkForCurrentSession(fpOpt.get());
+                refreshUiState();
+            });
+        }, "blipper-approve-net");
+        worker.setDaemon(true);
+        worker.start();
     }
 
-    private void startPairingSession() {
-        if (!networkService.isCurrentNetworkTrusted()) {
-            approveCurrentNetwork();
-            if (!networkService.isCurrentNetworkTrusted()) {
-                return;
-            }
-        }
+    private void startPairingSessionAsync() {
         int digits = digitsCombo.getSelectedIndex() == 1 ? 8 : 6;
         Duration ttl = unlimitedCheck.isSelected()
                 ? Duration.ZERO
                 : Duration.ofHours(((Number) hoursSpinner.getValue()).intValue());
-        try {
-            var info = lanServer.startForPairing(configuredLanPort, configuredUdpPort, digits, ttl);
-            String ip = networkService.getApprovedNetwork().map(NetworkFingerprint::ipv4Address).orElse("LAN-IP");
-            this.currentPinDisplay = info.pinCode();
-            this.currentHostPortDisplay = ip + ":" + info.lanPort();
-            refreshUiState();
-        } catch (Exception ex) {
-            JOptionPane.showMessageDialog(this,
-                    "Eşleştirme başlatılamadı: " + ex.getMessage(),
-                    "Güvenlik Hatası", JOptionPane.ERROR_MESSAGE);
-        }
+
+        Thread worker = new Thread(() -> {
+            if (!networkService.isCurrentNetworkTrusted()) {
+                Optional<NetworkFingerprint> fpOpt = networkService.readCurrentNetwork();
+                if (fpOpt.isEmpty()) {
+                    SwingUtilities.invokeLater(() -> JOptionPane.showMessageDialog(this,
+                            "Aktif bir ağ geçidi bulunamadı. Wi-Fi veya Ethernet bağlantınızı kontrol edin.",
+                            "Ağ Bulunamadı", JOptionPane.WARNING_MESSAGE));
+                    return;
+                }
+                networkService.approveNetworkForCurrentSession(fpOpt.get());
+            }
+            try {
+                var info = lanServer.startForPairing(configuredLanPort, configuredUdpPort, digits, ttl);
+                String ip = networkService.getApprovedNetwork().map(NetworkFingerprint::ipv4Address).orElse("LAN-IP");
+                SwingUtilities.invokeLater(() -> {
+                    this.currentPinDisplay = info.pinCode();
+                    this.currentHostPortDisplay = ip + ":" + info.lanPort();
+                    refreshUiState();
+                });
+            } catch (Exception ex) {
+                SwingUtilities.invokeLater(() -> JOptionPane.showMessageDialog(this,
+                        "Eşleştirme başlatılamadı: " + ex.getMessage(),
+                        "Güvenlik Hatası", JOptionPane.ERROR_MESSAGE));
+            }
+        }, "blipper-start-pair");
+        worker.setDaemon(true);
+        worker.start();
     }
 
     private void runElevatedFirewallRule(boolean enable) {
@@ -253,8 +301,8 @@ public class ControlPanelWindow extends JFrame {
     }
 
     private void refreshUiState() {
-        Optional<NetworkFingerprint> currentNet = networkService.readCurrentNetwork();
-        boolean netTrusted = networkService.isCurrentNetworkTrusted();
+        Optional<NetworkFingerprint> currentNet = networkService.getCachedSnapshot();
+        boolean netTrusted = currentNet.filter(networkService::matchesApprovedNetwork).isPresent();
         if (currentNet.isPresent()) {
             NetworkFingerprint fp = currentNet.get();
             networkInfoLabel.setText(String.format(
@@ -263,7 +311,7 @@ public class ControlPanelWindow extends JFrame {
                     netTrusted ? "ONAYLI EV AĞI ✓" : "ONAYSIZ (KİLİTLİ)"
             ));
         } else {
-            networkInfoLabel.setText("Aktif ağ bağlantısı yok — LAN portu kilitli.");
+            networkInfoLabel.setText("Aktif ağ kontrol ediliyor veya ağ bağlantısı yok — LAN portu kilitli.");
         }
 
         SessionStateRegistry.State st = sessionRegistry.getState();

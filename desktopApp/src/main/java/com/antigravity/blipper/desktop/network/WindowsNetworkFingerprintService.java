@@ -1,5 +1,6 @@
 package com.antigravity.blipper.desktop.network;
 
+import jakarta.annotation.PreDestroy;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
@@ -8,7 +9,11 @@ import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.Optional;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
 
 @Service
@@ -31,7 +36,16 @@ public class WindowsNetworkFingerprintService {
             + "}";
 
     private final Supplier<String> rawProbeSupplier;
+    private final ExecutorService backgroundProbeExecutor = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "blipper-net-probe");
+        t.setDaemon(true);
+        return t;
+    });
+    private final AtomicBoolean refreshInFlight = new AtomicBoolean(false);
+    private final AtomicLong lastRefreshStartedAtMs = new AtomicLong(0L);
+
     private volatile NetworkFingerprint approvedNetwork;
+    private volatile NetworkFingerprint cachedSnapshot;
 
     @Autowired
     public WindowsNetworkFingerprintService() {
@@ -46,16 +60,64 @@ public class WindowsNetworkFingerprintService {
         try {
             String line = rawProbeSupplier.get();
             if (line == null || line.isBlank()) {
+                this.cachedSnapshot = null;
+                this.lastRefreshStartedAtMs.set(System.currentTimeMillis());
                 return Optional.empty();
             }
             String[] parts = line.trim().split("\\|", -1);
             if (parts.length < 5) {
+                this.cachedSnapshot = null;
+                this.lastRefreshStartedAtMs.set(System.currentTimeMillis());
                 return Optional.empty();
             }
             NetworkFingerprint fp = new NetworkFingerprint(parts[0], parts[1], parts[2], parts[3], parts[4]);
-            return fp.isValidForLock() ? Optional.of(fp) : Optional.empty();
-        } catch (Exception e) {
+            if (fp.isValidForLock()) {
+                this.cachedSnapshot = fp;
+                this.lastRefreshStartedAtMs.set(System.currentTimeMillis());
+                return Optional.of(fp);
+            }
+            this.cachedSnapshot = null;
+            this.lastRefreshStartedAtMs.set(System.currentTimeMillis());
             return Optional.empty();
+        } catch (Exception e) {
+            this.cachedSnapshot = null;
+            return Optional.empty();
+        }
+    }
+
+    public Optional<NetworkFingerprint> getCachedSnapshot() {
+        return Optional.ofNullable(cachedSnapshot);
+    }
+
+    public void requestBackgroundRefreshIfStale(long minIntervalMs) {
+        requestBackgroundRefreshIfStale(minIntervalMs, null);
+    }
+
+    public void requestBackgroundRefreshIfStale(long minIntervalMs, Runnable onCompleteCallback) {
+        long now = System.currentTimeMillis();
+        long last = lastRefreshStartedAtMs.get();
+        if (minIntervalMs > 0L && last > 0L && (now - last) < minIntervalMs) {
+            return;
+        }
+        if (!refreshInFlight.compareAndSet(false, true)) {
+            return;
+        }
+        lastRefreshStartedAtMs.set(now);
+        try {
+            backgroundProbeExecutor.submit(() -> {
+                try {
+                    readCurrentNetwork();
+                } finally {
+                    refreshInFlight.set(false);
+                    if (onCompleteCallback != null) {
+                        try {
+                            onCompleteCallback.run();
+                        } catch (Exception ignored) {}
+                    }
+                }
+            });
+        } catch (Exception e) {
+            refreshInFlight.set(false);
         }
     }
 
@@ -64,10 +126,27 @@ public class WindowsNetworkFingerprintService {
             throw new IllegalArgumentException("Cannot approve incomplete network fingerprint");
         }
         this.approvedNetwork = fingerprint;
+        this.cachedSnapshot = fingerprint;
     }
 
     public synchronized Optional<NetworkFingerprint> getApprovedNetwork() {
         return Optional.ofNullable(approvedNetwork);
+    }
+
+    public boolean matchesApprovedNetwork(NetworkFingerprint candidate) {
+        NetworkFingerprint approved = this.approvedNetwork;
+        if (approved == null || !approved.isValidForLock() || candidate == null || !candidate.isValidForLock()) {
+            return false;
+        }
+        boolean profileMatches = MessageDigest.isEqual(
+                approved.profileName().getBytes(StandardCharsets.UTF_8),
+                candidate.profileName().getBytes(StandardCharsets.UTF_8)
+        );
+        boolean macMatches = MessageDigest.isEqual(
+                approved.gatewayMac().getBytes(StandardCharsets.UTF_8),
+                candidate.gatewayMac().getBytes(StandardCharsets.UTF_8)
+        );
+        return profileMatches && macMatches;
     }
 
     public boolean isCurrentNetworkTrusted() {
@@ -76,23 +155,16 @@ public class WindowsNetworkFingerprintService {
             return false;
         }
         Optional<NetworkFingerprint> currentOpt = readCurrentNetwork();
-        if (currentOpt.isEmpty()) {
-            return false;
-        }
-        NetworkFingerprint current = currentOpt.get();
-        boolean profileMatches = MessageDigest.isEqual(
-                approved.profileName().getBytes(StandardCharsets.UTF_8),
-                current.profileName().getBytes(StandardCharsets.UTF_8)
-        );
-        boolean macMatches = MessageDigest.isEqual(
-                approved.gatewayMac().getBytes(StandardCharsets.UTF_8),
-                current.gatewayMac().getBytes(StandardCharsets.UTF_8)
-        );
-        return profileMatches && macMatches;
+        return currentOpt.filter(this::matchesApprovedNetwork).isPresent();
     }
 
     public synchronized void clearApprovedNetwork() {
         this.approvedNetwork = null;
+    }
+
+    @PreDestroy
+    public void shutdown() {
+        backgroundProbeExecutor.shutdownNow();
     }
 
     public String buildLocalSubnetFirewallScript(int lanPort, int udpPort, boolean enable) {
