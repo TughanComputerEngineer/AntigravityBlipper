@@ -171,10 +171,11 @@ class BlipperSecureWsClient(
             openAuthenticatedWebSocket(client, host, tlsPort, bearerToken)
             Result.success(Unit)
         } catch (e: Exception) {
-            Arrays.fill(pinCharsForProof, '\u0000')
-            Arrays.fill(pinCharsForVerify, '\u0000')
             triggerLocalCleanupAndNotify("CONNECT_EXCEPTION")
             Result.failure(e)
+        } finally {
+            Arrays.fill(pinCharsForProof, '\u0000')
+            Arrays.fill(pinCharsForVerify, '\u0000')
         }
     }
 
@@ -290,8 +291,11 @@ class BlipperSecureWsClient(
             try {
                 val payload = JSONObject().put("reason", reason).toString()
                 val env = cryptoEngine.signEnvelope(hmacKey, "NUCLEAR_TEARDOWN", payload)
-                ws.send(env.toJsonString())
+                val enqueued = ws.send(env.toJsonString())
                 ws.close(1000, "NUCLEAR_TEARDOWN")
+                if (enqueued) {
+                    runCatching { Thread.sleep(120L) }
+                }
             } catch (_: Exception) {
             } finally {
                 Arrays.fill(hmacKey, 0.toByte())

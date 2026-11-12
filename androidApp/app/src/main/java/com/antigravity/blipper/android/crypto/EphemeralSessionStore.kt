@@ -116,8 +116,60 @@ class EphemeralSessionStore {
     }
 }
 
+data class StagedPairingRequest(
+    val host: String,
+    val port: Int,
+    val serverCertSha256Hex: String,
+    val pinChars: CharArray
+) {
+    fun zeroize() {
+        Arrays.fill(pinChars, '\u0000')
+    }
+}
+
 object BlipperAppGraph {
+    private val stagingLock = Any()
+    private var stagedRequest: StagedPairingRequest? = null
+
+    @Volatile
+    var activeDisconnectHandler: ((String) -> Unit)? = null
+
     val cryptoEngine = PairingCryptoEngine()
     val hardwareKeyManager = HardwareKeyManager()
     val sessionStore = EphemeralSessionStore()
+
+    fun stagePairingRequest(host: String, port: Int, serverCertSha256Hex: String, pin: String) {
+        synchronized(stagingLock) {
+            stagedRequest?.zeroize()
+            stagedRequest = StagedPairingRequest(
+                host = host.trim(),
+                port = port,
+                serverCertSha256Hex = serverCertSha256Hex.trim(),
+                pinChars = pin.trim().toCharArray()
+            )
+        }
+    }
+
+    fun consumeStagedPairingRequest(): StagedPairingRequest? = synchronized(stagingLock) {
+        val current = stagedRequest
+        stagedRequest = null
+        current
+    }
+
+    fun clearStagedPairingRequest() = synchronized(stagingLock) {
+        stagedRequest?.zeroize()
+        stagedRequest = null
+    }
+
+    fun triggerGlobalNuclearTeardown(reason: String) {
+        clearStagedPairingRequest()
+        val handler = activeDisconnectHandler
+        if (handler != null) {
+            handler.invoke(reason)
+        } else {
+            cryptoEngine.clearReplayCache()
+            hardwareKeyManager.wipeAllKeys()
+            sessionStore.wipeEverything()
+        }
+    }
 }
