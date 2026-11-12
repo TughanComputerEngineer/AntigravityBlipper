@@ -105,13 +105,6 @@ namespace AntigravityBlipperLauncher
 
         private static string ResolveOrExtractJar()
         {
-            string exeDir = AppDomain.CurrentDomain.BaseDirectory;
-            string siblingBuildJar = Path.Combine(exeDir, "desktopApp", "build", "libs", "blipper-desktop-1.0.0.jar");
-            if (File.Exists(siblingBuildJar))
-            {
-                return siblingBuildJar;
-            }
-
             Assembly asm = Assembly.GetExecutingAssembly();
             using (Stream res = asm.GetManifestResourceStream(EmbeddedResourceName))
             {

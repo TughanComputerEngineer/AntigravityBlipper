@@ -116,8 +116,14 @@ class AntigravityHookIntegrationTest {
         assertTrue(merged.has("antigravity-blipper"), "Must register antigravity-blipper Stop hook");
         assertTrue(merged.path("antigravity-blipper").path("Stop").isArray());
 
-        // Execute the generated .cmd hook via cmd.exe /c while port 59997 is CLOSED!
-        Process proc = new ProcessBuilder("cmd.exe", "/c", cmdFile.toAbsolutePath().toString())
+        String hookCommand = merged.path("antigravity-blipper").path("Stop").get(0).path("command").asText();
+        assertFalse(hookCommand.contains("\""),
+                "Windows cmd.exe /c via CreateProcess escapes inner quotes as \\\" and fails; command must contain zero quotes");
+        assertTrue(hookCommand.chars().allMatch(ch -> ch < 128),
+                "Hook command must be 100% pure ASCII so non-ASCII user profile paths (e.g. Tuğhan) never break cmd.exe");
+
+        // Execute the exact hooks.json command via cmd.exe /c while port 59997 is CLOSED!
+        Process proc = new ProcessBuilder("cmd.exe", "/c", hookCommand)
                 .redirectErrorStream(false)
                 .start();
         try (OutputStream stdin = proc.getOutputStream()) {
@@ -128,6 +134,42 @@ class AntigravityHookIntegrationTest {
         assertEquals(0, proc.exitValue(), "Hook script must exit 0 even when desktopApp is offline");
         String stdout = new String(proc.getInputStream().readAllBytes(), StandardCharsets.UTF_8).trim();
         assertEquals("{}", stdout, "Stop hook stdout must be valid JSON {} so Antigravity allows normal stop");
+
+        // Also verify online delivery via real loopback HTTP server + cmd.exe /c hookCommand!
+        com.sun.net.httpserver.HttpServer loopbackSrv =
+                com.sun.net.httpserver.HttpServer.create(new java.net.InetSocketAddress("127.0.0.1", 0), 0);
+        java.util.concurrent.atomic.AtomicReference<String> receivedHeader = new java.util.concurrent.atomic.AtomicReference<>("");
+        java.util.concurrent.atomic.AtomicReference<String> receivedBody = new java.util.concurrent.atomic.AtomicReference<>("");
+        loopbackSrv.createContext("/local/v1/agy-stop", exchange -> {
+            receivedHeader.set(exchange.getRequestHeaders().getFirst(LocalHookSecretManager.HEADER_NAME));
+            receivedBody.set(new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8));
+            byte[] ok = "{\"dispatched\":true}".getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, ok.length);
+            exchange.getResponseBody().write(ok);
+            exchange.close();
+        });
+        loopbackSrv.start();
+        try {
+            int livePort = loopbackSrv.getAddress().getPort();
+            var onlineInstaller = new AntigravityHookInstaller(
+                    hooksJsonPath, blipperDir.resolve("agy-stop-hook.cmd"), secretMgr, livePort);
+            onlineInstaller.installOrUpdateGlobalStopHook();
+            JsonNode liveMerged = mapper.readTree(Files.readString(hooksJsonPath, StandardCharsets.UTF_8));
+            String liveCommand = liveMerged.path("antigravity-blipper").path("Stop").get(0).path("command").asText();
+
+            Process liveProc = new ProcessBuilder("cmd.exe", "/c", liveCommand).start();
+            String samplePayload = "{\"conversationId\":\"conv-live\",\"terminationReason\":\"NO_TOOL_CALL\",\"lastUserInput\":\"Şimdi deneme zamanı\"}";
+            try (OutputStream stdin = liveProc.getOutputStream()) {
+                stdin.write(samplePayload.getBytes(StandardCharsets.UTF_8));
+            }
+            assertTrue(liveProc.waitFor(4, TimeUnit.SECONDS));
+            assertEquals(0, liveProc.exitValue());
+            assertEquals("{}", new String(liveProc.getInputStream().readAllBytes(), StandardCharsets.UTF_8).trim());
+            assertEquals(secretMgr.getOrCreateSecret(), receivedHeader.get());
+            assertEquals(samplePayload, receivedBody.get());
+        } finally {
+            loopbackSrv.stop(0);
+        }
     }
 
     @Test

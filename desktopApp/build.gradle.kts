@@ -39,3 +39,10 @@ tasks.withType<Test> {
     systemProperty("file.encoding", "UTF-8")
     systemProperty("blipper.ui.enabled", "false")
 }
+
+tasks.named<org.springframework.boot.gradle.tasks.bundling.BootJar>("bootJar") {
+    val customOut = project.findProperty("bootJarName")?.toString()
+    if (!customOut.isNullOrBlank()) {
+        archiveFileName.set(customOut)
+    }
+}

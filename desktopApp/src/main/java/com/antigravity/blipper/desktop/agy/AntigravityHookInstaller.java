@@ -60,13 +60,16 @@ public class AntigravityHookInstaller {
                 Files.createDirectories(cmdParent);
             }
 
+            // 100% pure-ASCII, zero-double-quote inline command so Windows CreateProcess("cmd.exe", "/c", cmd)
+            // never escapes quotes into \" and never chokes on non-ASCII user profile directories (e.g. Tuğhan).
+            String inlineAsciiCommand = "%SystemRoot%\\System32\\curl.exe --connect-timeout 1 --max-time 2 -s -o NUL "
+                    + "-X POST http://127.0.0.1:" + loopbackPort + "/local/v1/agy-stop "
+                    + "-H Content-Type:application/json "
+                    + "-H " + LocalHookSecretManager.HEADER_NAME + ":" + secret + " "
+                    + "--data-binary @- >nul 2>&1 & echo {}";
+
             String cmdScript = "@echo off\r\n"
-                    + "\"%SystemRoot%\\System32\\curl.exe\" --connect-timeout 1 --max-time 2 -s -o NUL "
-                    + "-X POST \"http://127.0.0.1:" + loopbackPort + "/local/v1/agy-stop\" "
-                    + "-H \"Content-Type: application/json; charset=utf-8\" "
-                    + "-H \"" + LocalHookSecretManager.HEADER_NAME + ": " + secret + "\" "
-                    + "--data-binary @- >nul 2>&1\r\n"
-                    + "echo {}\r\n"
+                    + inlineAsciiCommand + "\r\n"
                     + "exit /b 0\r\n";
 
             Files.writeString(
@@ -96,7 +99,7 @@ public class AntigravityHookInstaller {
             ArrayNode stopHandlers = mapper.createArrayNode();
             ObjectNode handler = mapper.createObjectNode();
             handler.put("type", "command");
-            handler.put("command", "\"" + hookCmdPath.toAbsolutePath() + "\"");
+            handler.put("command", inlineAsciiCommand);
             handler.put("timeout", 5);
             stopHandlers.add(handler);
             blipperHook.set("Stop", stopHandlers);

@@ -1,16 +1,17 @@
 $ErrorActionPreference = "Stop"
 
 $repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
-$jarPath = Join-Path $repoRoot "desktopApp\build\libs\blipper-desktop-1.0.0.jar"
+$jarPath = Join-Path $repoRoot "desktopApp\build\libs\blipper-exe-payload.jar"
 $csPath = Join-Path $PSScriptRoot "BlipperLauncher.cs"
 $icoPath = Join-Path $PSScriptRoot "blipper.ico"
 $exeOutPath = Join-Path $repoRoot "AntigravityBlipper.exe"
 $cscPath = "C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
 
-if (-not (Test-Path $jarPath)) {
-    $env:JAVA_HOME = "C:\Program Files\Android\Android Studio\jbr"
-    $env:GRADLE_USER_HOME = Join-Path $repoRoot ".gradle-home"
-    & (Join-Path $repoRoot "desktopApp\gradlew.bat") -p (Join-Path $repoRoot "desktopApp") bootJar
+$env:JAVA_HOME = "C:\Program Files\Android\Android Studio\jbr"
+$env:GRADLE_USER_HOME = Join-Path $repoRoot ".gradle-home"
+& (Join-Path $repoRoot "desktopApp\gradlew.bat") -p (Join-Path $repoRoot "desktopApp") "-PbootJarName=blipper-exe-payload.jar" bootJar
+if ($LASTEXITCODE -ne 0) {
+    throw "Gradle bootJar failed with exit code $LASTEXITCODE"
 }
 
 # Generate a crisp 256x256 PNG-backed Windows .ico icon (cyber dark shield + neon cyan lightning bolt)
